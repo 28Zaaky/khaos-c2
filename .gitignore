@@ -1,0 +1,74 @@
+# .gitignore — KHAØS C2
+
+# ── Secrets & credentials ────────────────────────────────────────────────────
+server/config.yaml
+server/.env
+server/*.pem
+server/*.key
+server/*.crt
+agent/include/agent_config.h
+agent/include/evs_strings.h
+agent/src/config/agent_config.h
+
+# ── Landing (served separately — not part of the OSS release) ───────────────
+landing/
+
+# ── Internal docs ───────────────────────────────────────────────────────────
+LegitC2_CahierDesCharges.md
+
+# ── Python ──────────────────────────────────────────────────────────────────
+server/venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+server/*.db
+server/*.log
+server/server_out.txt
+server/server_err.txt
+server/build/
+server/dist/
+
+# ── Node / UI ────────────────────────────────────────────────────────────────
+ui/node_modules/
+ui/dist/
+ui/.env
+ui/src-tauri/binaries/*.exe
+
+# ── Agent build artifacts ────────────────────────────────────────────────────
+agent/nul
+agent/agent_out*.txt
+agent/agent_err*.txt
+agent/st??????
+agent/build/
+agent/*.exe
+agent/*.dll
+agent/*.o
+agent/*.a
+agent/*.bin
+agent/*.bak
+
+# ── Crypter artifacts ────────────────────────────────────────────────────────
+crypter/output/
+crypter/stub/*.exe
+crypter/stub/*.bin
+crypter/stub/*.o
+crypter/stager/*.exe
+crypter/stager/*.bin
+crypter/stager/*.o
+crypter/stager/stager_cfg.h
+
+# ── Root artifacts ────────────────────────────────────────────────────────────
+vm_deploy.zip
+*.zip
+build-linux.sh
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Editors ──────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp

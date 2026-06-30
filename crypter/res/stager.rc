@@ -1,0 +1,32 @@
+#include <windows.h>
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    1,2,0,4
+ PRODUCTVERSION 1,2,0,4
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+ FILEFLAGS      0x0L
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_APP
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "Procyon Software Solutions"
+            VALUE "FileDescription",  "Automated Content Synchronization"
+            VALUE "FileVersion",      "1.2.0.4"
+            VALUE "InternalName",     "autosync"
+            VALUE "LegalCopyright",   "Copyright (C) 2022 Procyon Software Solutions. All rights reserved."
+            VALUE "OriginalFilename", "AutoSync.exe"
+            VALUE "ProductName",      "AutoSync Manager"
+            VALUE "ProductVersion",   "1.2"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 0x04B0
+    END
+END
+
+1 RT_MANIFEST "stager.manifest"

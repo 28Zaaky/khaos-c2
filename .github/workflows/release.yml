@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 mingw-w64 make \
+            python3 python3-pip nodejs npm
+
+      - name: Install Python deps
+        run: pip3 install -r server/requirements.txt
+
+      - name: Build UI
+        run: cd ui && npm ci && npm run build
+
+      - name: Build agent (standalone HTTP — demo build)
+        run: |
+          cd agent
+          touch include/agent_config.h include/evs_strings.h
+          make standalone BEACON_URL=""
+        continue-on-error: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: KHAØS C2 ${{ github.ref_name }}
+          files: |
+            agent/agent.exe
+          body: |
+            ## KHAØS C2 ${{ github.ref_name }}
+
+            ### Quick start (Linux VPS)
+
+            ```bash
+            git clone https://github.com/28Zaaky/khaos-c2
+            cd khaos-c2
+            sudo bash install.sh
+            # edit server/config.yaml
+            python3 server/main.py
+            ```
+
+            ### Agent
+
+            Build via the **UI → Build tab** (MinGW is installed by `install.sh`).
+            No local toolchain required on the operator machine.
+
+            The `agent.exe` attached to this release is a **demo build** (no credentials embedded).
+            It will not beacon anywhere. Rebuild from the UI after configuring `config.yaml`.
+
+            ### Channels
+            `Teams` / `GitHub Gist` / `DNS-over-HTTPS` / `HTTP` / `SMB pivot`
+            Enable only what you need in `config.yaml` — unconfigured channels are skipped.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

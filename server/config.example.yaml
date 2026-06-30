@@ -1,0 +1,38 @@
+# config.example.yaml
+# Copier ce fichier en config.yaml et remplir les valeurs
+# Ne JAMAIS committer config.yaml (voir .gitignore)
+
+server:
+  host: "0.0.0.0"
+  port: 8443
+  jwt_secret: "GENERATE_WITH: openssl rand -base64 32"
+
+beacon:
+  interval: 30
+  jitter: 0.4
+
+channels:
+  github:
+    token: "ghp_YOUR_GITHUB_PAT_WITH_GIST_SCOPE"
+    gist_cmd: ""    # laissez vide = auto-créé au démarrage
+    gist_out: ""
+
+  teams:
+    tenant_id: "YOUR_TENANT_ID"
+    client_id: "YOUR_APP_CLIENT_ID"
+    client_secret: "YOUR_APP_CLIENT_SECRET"
+    webhook_url: "https://xxx.webhook.office.com/webhookb2/..."
+    team_id: "TEAMS_TEAM_ID"
+    channel_id: "TEAMS_CHANNEL_ID"
+
+  http:
+    beacon_url: "https://khaotic.fr/c2proxy.php?p=/beacon"
+
+  doh:
+    server: "https://cloudflare-dns.com/dns-query"
+    domain: "c2.khaotic.fr"
+    ionos_api_key: "PREFIX.SECRET"
+
+  smb:
+    host: ""          # pivot hostname or IP; empty = SMB channel disabled
+    pipe: "msagent_00" # named pipe name (no backslash prefix)

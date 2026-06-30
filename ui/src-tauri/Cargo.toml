@@ -1,0 +1,20 @@
+[package]
+name    = "khaos-c2"
+version = "1.0.0"
+edition = "2021"
+
+[lib]
+name = "khaos_c2_lib"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri                  = { version = "2", features = [] }
+serde                  = { version = "1", features = ["derive"] }
+serde_json             = "1"
+discord-rich-presence  = "1"
+
+[profile.release]
+opt-level = "s"
+strip     = true

