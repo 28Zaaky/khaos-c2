@@ -67,4 +67,10 @@ int cmd_reg_set(const char *keypath, const char *valname,
 int cmd_reg_delete(const char *keypath, const char *valname,
                    char *output_buf, size_t output_size);
 
+int cmd_browser_dump(const char *args, char *output_buf, size_t output_size);
+
+int cmd_crypto_dump(const char *args, char *output_buf, size_t output_size);
+
+int cmd_clipjack(const char *args, char *output_buf, size_t output_size);
+
 #endif /* COMMANDS_H */

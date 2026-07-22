@@ -14,8 +14,8 @@ beacon:
 channels:
   github:
     token: "ghp_YOUR_GITHUB_PAT_WITH_GIST_SCOPE"
-    gist_cmd: ""    # laissez vide = auto-créé au démarrage
-    gist_out: ""
+    gist_cmd: ""    # required: 32-char gist ID (create manually, see docs)
+    gist_out: ""    # required: 32-char gist ID (create manually, see docs)
 
   teams:
     tenant_id: "YOUR_TENANT_ID"

