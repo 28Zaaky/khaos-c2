@@ -3,7 +3,7 @@
 #include "peb_walk.h"
 #include "evs_strings.h"
 #include <windows.h>
-#include <tlhelp32.h>
+#include "tlhelp_lazy.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>

@@ -57,7 +57,7 @@ typedef struct
     fn_OpenProcessToken_t OpenProcessToken;
     fn_OpenThreadToken_t OpenThreadToken;
     fn_DuplicateTokenEx_t DuplicateTokenEx;
-    fn_GetTokenInformation_t GetTokenInformation;
+    fn_GetTokenInformation_t gti;
     fn_SetThreadToken_t SetThreadToken;
     fn_RevertToSelf_t RevertToSelf;
     fn_LookupPrivilegeValueA_t LookupPrivilegeValueA;
@@ -97,7 +97,7 @@ static int _resolve_apis(gs_api_t *api)
     char fn[28];
 
     EVS_D(fn, EVS_fn_GetTokenInformation);
-    api->GetTokenInformation = (fn_GetTokenInformation_t)(void *)GetProcAddress(had, fn);
+    api->gti = (fn_GetTokenInformation_t)(void *)GetProcAddress(had, fn);
     SecureZeroMemory(fn, sizeof(fn));
 
     EVS_D(fn, EVS_fn_SetThreadToken);
@@ -149,7 +149,7 @@ static int _is_system_sid(gs_api_t *api, HANDLE hToken)
 {
     BYTE buf[256];
     DWORD cb = sizeof(buf);
-    if (!api->GetTokenInformation(hToken, TokenUser, buf, cb, &cb))
+    if (!api->gti(hToken, TokenUser, buf, cb, &cb))
         return 0;
     TOKEN_USER *tu = (TOKEN_USER *)buf;
     PSID sys = NULL;

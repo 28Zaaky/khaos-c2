@@ -1,4 +1,5 @@
 import hashlib, secrets
+from typing import Optional
 from sqlalchemy import String, Boolean
 from sqlalchemy.orm import mapped_column, Mapped
 from models.agent import Base
@@ -7,10 +8,11 @@ from models.agent import Base
 class User(Base):
     __tablename__ = "users"
 
-    username:      Mapped[str]  = mapped_column(String(64),  primary_key=True)
-    password_hash: Mapped[str]  = mapped_column(String(256), default="")
-    role:          Mapped[str]  = mapped_column(String(16),  default="operator")
-    is_active:     Mapped[bool] = mapped_column(Boolean,     default=True)
+    username:      Mapped[str]           = mapped_column(String(64),  primary_key=True)
+    password_hash: Mapped[str]           = mapped_column(String(256), default="")
+    role:          Mapped[str]           = mapped_column(String(16),  default="operator")
+    is_active:     Mapped[bool]          = mapped_column(Boolean,     default=True)
+    license_key:   Mapped[Optional[str]] = mapped_column(String(64),  nullable=True, default=None)
 
     @staticmethod
     def hash_password(password: str) -> str:

@@ -71,7 +71,6 @@ static void _gns(LPSYSTEM_INFO si) {
         SecureZeroMemory(fs, sizeof(fs));
     }
     if (fn) fn(si);
-    else GetSystemInfo(si);
 }
 
 void agent_get_os(char *buf, size_t len)

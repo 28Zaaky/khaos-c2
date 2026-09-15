@@ -45,9 +45,10 @@ class TokenResponse(BaseModel):
     token_type:   str = "bearer"
 
 class CreateUserRequest(BaseModel):
-    username: str
-    password: str
-    role:     str = "operator"
+    username:    str
+    password:    str
+    role:        str           = "operator"
+    license_key: str | None    = None   # required when role == "client"
 
 
 # ---- Token helpers ----
@@ -82,6 +83,33 @@ def verify_admin(credentials: HTTPAuthorizationCredentials = Depends(bearer)) ->
     if payload.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     return payload["sub"]
+
+
+def verify_phantom_access(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer),
+    db: Session = Depends(database.get_db),
+) -> dict:
+    """Accepts admin OR client JWT.
+    Returns {'username', 'role', 'license_key'}.
+    For admin: license_key is None (provided in request body).
+    For client: license_key is fetched from DB (cannot be overridden by caller).
+    """
+    payload = _decode(credentials.credentials)
+    role = payload.get("role", "")
+    sub  = payload["sub"]
+
+    if role == "admin":
+        return {"username": sub, "role": "admin", "license_key": None}
+
+    if role == "client":
+        user = db.get(User, sub)
+        if not user or not user.is_active:
+            raise HTTPException(status_code=403, detail="Account disabled")
+        if not user.license_key:
+            raise HTTPException(status_code=403, detail="No license assigned to this account")
+        return {"username": sub, "role": "client", "license_key": user.license_key}
+
+    raise HTTPException(status_code=403, detail="Access denied")
 
 
 def verify_token_str(token: str) -> str:
@@ -125,7 +153,12 @@ async def list_users(
     db: Session = Depends(database.get_db),
 ):
     return [
-        {"username": u.username, "role": u.role, "is_active": u.is_active}
+        {
+            "username":    u.username,
+            "role":        u.role,
+            "is_active":   u.is_active,
+            "license_key": u.license_key if u.role == "client" else None,
+        }
         for u in db.query(User).order_by(User.username).all()
     ]
 
@@ -136,8 +169,10 @@ async def create_user(
     _admin: str = Depends(verify_admin),
     db: Session = Depends(database.get_db),
 ):
-    if body.role not in ("admin", "operator"):
-        raise HTTPException(status_code=400, detail="role must be 'admin' or 'operator'")
+    if body.role not in ("admin", "operator", "client"):
+        raise HTTPException(status_code=400, detail="role must be 'admin', 'operator', or 'client'")
+    if body.role == "client" and not body.license_key:
+        raise HTTPException(status_code=400, detail="license_key is required for client accounts")
     if db.get(User, body.username):
         raise HTTPException(status_code=409, detail="User already exists")
     user = User(
@@ -145,10 +180,11 @@ async def create_user(
         password_hash=User.hash_password(body.password),
         role=body.role,
         is_active=True,
+        license_key=body.license_key.strip().upper() if body.license_key else None,
     )
     db.add(user)
     db.commit()
-    return {"username": user.username, "role": user.role}
+    return {"username": user.username, "role": user.role, "license_key": user.license_key}
 
 
 @router.delete("/users/{username}", status_code=204)

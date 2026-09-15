@@ -2,6 +2,7 @@
 #define INITGUID
 
 #include "persist.h"
+#include "adv_lazy.h"
 #include "evs_strings.h"
 #include <windows.h>
 #include <ole2.h>

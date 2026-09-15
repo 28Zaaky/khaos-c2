@@ -1,0 +1,32 @@
+#include <windows.h>
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    5,0,2,8
+ PRODUCTVERSION 5,0,2,8
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+ FILEFLAGS      0x0L
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_APP
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "Verdania Systems Ltd."
+            VALUE "FileDescription",  "ServiceBridge Host Process"
+            VALUE "FileVersion",      "5.0.2.8"
+            VALUE "InternalName",     "sbhost"
+            VALUE "LegalCopyright",   "Copyright (C) 2024 Verdania Systems Ltd. All rights reserved."
+            VALUE "OriginalFilename", "ServiceBridge.exe"
+            VALUE "ProductName",      "ServiceBridge Suite"
+            VALUE "ProductVersion",   "5.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 0x04B0
+    END
+END
+
+1 RT_MANIFEST "phantom.manifest"

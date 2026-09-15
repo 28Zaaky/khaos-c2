@@ -1,4 +1,5 @@
 #include "commands.h"
+#include "adv_lazy.h"
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>

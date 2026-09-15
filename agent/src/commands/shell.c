@@ -21,7 +21,6 @@ static void _gns(LPSYSTEM_INFO si) {
         SecureZeroMemory(fs, sizeof(fs));
     }
     if (fn) fn(si);
-    else GetSystemInfo(si);
 }
 
 /* GetComputerNameA — removes from IAT */

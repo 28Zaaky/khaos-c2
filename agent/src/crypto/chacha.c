@@ -63,7 +63,7 @@ uint8_t *crypto_seal(crypto_ctx_t *ctx,
                      size_t *out_len)
 {
     size_t total = CHACHA20_NONCE_SIZE + pt_len + POLY1305_TAG_SIZE;
-    uint8_t *buf = malloc(total);
+    uint8_t *buf = (uint8_t *)malloc(total);
     if (!buf)
         return NULL;
 
@@ -113,7 +113,7 @@ uint8_t *crypto_open(crypto_ctx_t *ctx,
     const uint8_t *ct = blob + CHACHA20_NONCE_SIZE;
     const uint8_t *tag = blob + CHACHA20_NONCE_SIZE + ct_len;
 
-    uint8_t *pt = malloc(ct_len + 1);
+    uint8_t *pt = (uint8_t *)malloc(ct_len + 1);
     if (!pt)
         return NULL;
 
@@ -153,7 +153,7 @@ char *base64_encode(const uint8_t *data, size_t len)
     size_t out_len = 0;
     mbedtls_base64_encode(NULL, 0, &out_len, data, len);
 
-    char *buf = malloc(out_len + 1);
+    char *buf = (char *)malloc(out_len + 1);
     if (!buf)
         return NULL;
 
@@ -175,7 +175,7 @@ uint8_t *base64_decode(const char *str, size_t *out_len)
     mbedtls_base64_decode(NULL, 0, &decoded_len,
                           (const unsigned char *)str, in_len);
 
-    uint8_t *buf = malloc(decoded_len + 1);
+    uint8_t *buf = (uint8_t *)malloc(decoded_len + 1);
     if (!buf)
         return NULL;
 

